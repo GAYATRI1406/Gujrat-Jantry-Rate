@@ -1,0 +1,19 @@
+{
+  "name": "jantri-bot-server",
+  "version": "1.0.0",
+  "private": true,
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "node --watch src/index.js",
+    "start": "node src/index.js",
+    "sync": "node scripts/sync.js",
+    "selftest": "node scripts/selftest.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "mongoose": "^8.5.1",
+    "pdfjs-dist": "3.11.174",
+    "playwright-core": "^1.47.0",
+    "ws": "^8.18.0"
+  }
+}

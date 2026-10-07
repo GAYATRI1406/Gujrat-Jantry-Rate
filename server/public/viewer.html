@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Jantri PDF</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; font-family: "Segoe UI", system-ui, sans-serif; background: #525659; }
+  #bar { position: fixed; inset: 0 0 auto 0; height: 52px; z-index: 10; display: flex; align-items: center; gap: 14px;
+    padding: 0 18px; background: #323639; color: #f1f3f4; box-shadow: 0 2px 6px rgba(0,0,0,.4); font-size: 14px; }
+  #bar .tag { background: #d93025; color: #fff; font-weight: 700; font-size: 11px; padding: 3px 6px; border-radius: 4px; }
+  #name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 340px; }
+  #pg { background: #202124; padding: 5px 12px; border-radius: 4px; font-variant-numeric: tabular-nums; }
+  #find { margin-left: auto; display: flex; align-items: center; gap: 8px; background: #fff; border-radius: 6px; padding: 0 10px; height: 34px; width: 360px; }
+  #find svg { flex: none; }
+  #q { border: 0; outline: 0; flex: 1; font-size: 15px; font-family: inherit; color: #202124; }
+  #scroll { position: absolute; inset: 52px 0 0 0; overflow: auto; padding: 22px 0 60px; }
+  #sheet { position: relative; margin: 0 auto; background: #fff; box-shadow: 0 2px 14px rgba(0,0,0,.5); }
+  #sheet canvas { display: block; width: 100%; height: 100%; }
+  .mark { position: absolute; pointer-events: none; }
+  .mark.head { border: 0; }
+  .mark.block { border: 3px solid #ff9800; background: rgba(255, 235, 59, .16); border-radius: 4px; }
+  .mark.token { border: 2.5px solid #e53935; background: rgba(229, 57, 53, .12); border-radius: 3px; }
+  .mark.value { border: 2.5px solid #2e7d32; background: rgba(46, 125, 50, .14); border-radius: 3px; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <span class="tag">PDF</span>
+  <span id="name">-</span>
+  <span id="pg">- / -</span>
+  <label id="find">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#5f6368" stroke-width="2.4"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.5-4.5"/></svg>
+    <input id="q" placeholder="Find in document" autocomplete="off" spellcheck="false">
+  </label>
+</div>
+<div id="scroll"><div id="sheet"><canvas id="canvas"></canvas></div></div>
+
+<script src="/pdfjs/pdf.min.js"></script>
+<script>
+  pdfjsLib.GlobalWorkerOptions.workerSrc = '/pdfjs/pdf.worker.min.js';
+  const SHEET_WIDTH = 1040;
+  const sheet = document.getElementById('sheet');
+  const canvas = document.getElementById('canvas');
+  let doc = null;
+  let view = null; // { scale, height } of the page on screen, in PDF points
+
+  // Controlled by the bot through Playwright.
+  window.JV = {
+    async open(url, name) {
+      doc = await pdfjsLib.getDocument({ url }).promise;
+      document.getElementById('name').textContent = name;
+      await this.show(1);
+      return doc.numPages;
+    },
+
+    async show(pageNo) {
+      const page = await doc.getPage(pageNo);
+      const base = page.getViewport({ scale: 1 });
+      const scale = SHEET_WIDTH / base.width;
+      const dpr = window.devicePixelRatio || 1;
+      const viewport = page.getViewport({ scale: scale * dpr });
+      this.clear();
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      sheet.style.width = `${base.width * scale}px`;
+      sheet.style.height = `${base.height * scale}px`;
+      await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+      view = { scale, height: base.height };
+      document.getElementById('pg').textContent = `${pageNo} / ${doc.numPages}`;
+      document.getElementById('scroll').scrollTop = 0;
+    },
+
+    // rects are in PDF points with the origin at the bottom-left: { kind, x, w, top, bottom }
+    mark(rects) {
+      this.clear();
+      for (const r of rects) {
+        const el = document.createElement('div');
+        el.className = `mark ${r.kind}`;
+        el.style.left = `${r.x * view.scale}px`;
+        el.style.width = `${r.w * view.scale}px`;
+        el.style.top = `${(view.height - r.top) * view.scale}px`;
+        el.style.height = `${(r.top - r.bottom) * view.scale}px`;
+        sheet.appendChild(el);
+      }
+      const block = sheet.querySelector('.mark.block');
+      if (block) block.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    },
+
+    clear() {
+      sheet.querySelectorAll('.mark').forEach((el) => el.remove());
+    },
+  };
+</script>
+</body>
+</html>
