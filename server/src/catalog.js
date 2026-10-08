@@ -5,9 +5,11 @@ const fs = require('fs');
 const path = require('path');
 
 const { INDEX_DIR } = require('./config');
+const { similarNames } = require('./lookup');
+const { nameKey, splitSectionName } = require('./names');
 
 const CATALOG_FILE = path.join(__dirname, '..', 'catalog.json');
-const KIND_LABEL = { CORPORATION: 'Corporation', NAGARPALIKA: 'Nagarpalika', RURAL_NA: 'Rural NA' };
+const KIND_LABEL = { CORPORATION: 'Corporation', NAGARPALIKA: 'Nagarpalika', RURAL_NA: 'Rural NA', RURAL_AGRI: 'Rural Agri' };
 const KIND_ORDER = ['CORPORATION', 'NAGARPALIKA', 'RURAL_NA'];
 
 const key = (s) => String(s || '').toUpperCase().replace(/\(.*?\)/g, '').replace(/[^A-Z0-9]/g, '');
@@ -61,48 +63,72 @@ function filesForDistrict(district) {
   return [...all.filter((f) => f.kind && f.district === real), ...unreadable];
 }
 
+// Is the village (with its TPS, when one is given) a section of this PDF? Names must match exactly.
 function hasVillage(file, q) {
   const village = key(q.village);
   if (!village) return false;
   const tps = q.tps ? String(Number(q.tps)) : null;
   return file.names.some((name) => {
-    const m = name.match(/^(.*?)\s*TPS\s*-?\s*0*(\d+)\s*$/i);
-    if (file.kind !== 'RURAL_NA' && tps) return m && m[2] === tps && key(m[1]) === village;
-    const section = key(m ? m[1] : name);
-    return section === village || (file.kind !== 'RURAL_NA' && section.startsWith(village));
+    // village tables have no TP schemes, so a request with a TPS number is never about them
+    if (file.kind === 'RURAL_NA' || file.kind === 'RURAL_AGRI') return !tps && nameKey(name) === village;
+    if (nameKey(name) === village) return true; // the full section name as printed
+    const section = splitSectionName(name);
+    if (tps) return section.tps === tps && nameKey(section.village) === village;
+    return nameKey(section.village) === village;
   });
 }
 
-// Chooses the PDF for a query. Returns { file, notes } or throws with a clear reason.
-function choosePdf(q) {
+const failure = (status, reason, message, extra = {}) => ({ failure: { status, reason, message, suggestions: [], candidates: [], ...extra } });
+const manual = (type, description, extra = {}) => ({ type, description, requiresManualVerification: true, ...extra });
+
+// Decides which PDF holds the property. Returns { file, notes }, or { failure } with the status to report.
+// q.pdfType may be empty: then the PDF is the one (and only one) that lists the village.
+function resolvePdf(q) {
   const files = filesForDistrict(q.district);
-  const readable = files.filter((f) => f.kind);
-  const unreadable = files.filter((f) => !f.kind);
-  const notes = [];
   if (!files.length) {
-    const known = [...new Set(loadCatalog().map((f) => f.row).filter(Boolean))].join(', ');
-    throw new Error(`District "${q.district}" is not on the website. Districts available: ${known}.`);
+    return failure('not_found', 'district_not_found', `Exact Match Not Found: district "${q.district}" is not on the Jantri website.`,
+      { suggestions: [manual('available_districts', districts().join(', '))] });
+  }
+  // a village has two tables: Rural NA for non-agricultural land, Rural Agri for agricultural land
+  const agricultural = /^agri/.test(q.propertyType || '');
+  const readable = files.filter((f) => f.kind && f.kind !== (agricultural ? 'RURAL_NA' : 'RURAL_AGRI'));
+  if (agricultural && q.pdfType === 'RURAL_NA') q.pdfType = 'RURAL_AGRI';
+  const unreadable = files.filter((f) => !f.kind);
+  const unreadableNote = unreadable.length
+    ? `${unreadable.map((f) => f.file).join(', ')} is published without readable text, so properties listed only there cannot be searched automatically.`
+    : null;
+  const notes = [];
+
+  if (q.pdfType) {
+    const file = readable.find((f) => f.kind === q.pdfType);
+    if (!file) {
+      const have = [...new Set(readable.map((f) => KIND_LABEL[f.kind]))].join(', ') || 'none';
+      return failure('unsupported', unreadable.length ? 'document_not_readable' : 'document_not_available',
+        `There is no readable ${KIND_LABEL[q.pdfType] || q.pdfType} PDF for ${q.district} (readable: ${have}).${unreadableNote ? ` ${unreadableNote}` : ''}`);
+    }
+    const elsewhere = readable.filter((f) => f !== file && hasVillage(f, q));
+    if (!hasVillage(file, q) && elsewhere.length) {
+      notes.push(`"${q.village}" is listed in the ${elsewhere.map((f) => KIND_LABEL[f.kind]).join(' and ')} PDF of this district.`);
+    }
+    return { file, notes };
   }
 
-  const order = [q.pdfType, ...KIND_ORDER.filter((k) => k !== q.pdfType)];
-  const ranked = order.flatMap((kind) => readable.filter((f) => f.kind === kind));
-  const withVillage = ranked.filter((f) => hasVillage(f, q));
-  let file = withVillage[0] || ranked.find((f) => f.kind === q.pdfType);
-
-  if (file && file.kind !== q.pdfType) {
-    notes.push(`"${q.village}" is not in the ${KIND_LABEL[q.pdfType] || q.pdfType} PDF of ${q.district} - it is in the ${KIND_LABEL[file.kind]} PDF, so that one was searched.`);
+  const listing = readable.filter((f) => hasVillage(f, q));
+  if (listing.length === 1) return { file: listing[0], notes };
+  if (listing.length > 1) {
+    return failure('ambiguous', 'village_in_several_documents',
+      `Village "${q.village}" is listed in more than one PDF of ${q.district} (${listing.map((f) => KIND_LABEL[f.kind]).join(', ')}). Say which area type applies.`,
+      { candidates: listing.map((f) => manual('area_type', KIND_LABEL[f.kind], { areaType: f.kind })) });
   }
-  if (!file) {
-    const have = [...new Set(readable.map((f) => KIND_LABEL[f.kind]))].join(', ') || 'none';
-    const blocked = unreadable.length ? ` ${unreadable.map((f) => f.file).join(', ')} is on the website but its text cannot be read by a program.` : '';
-    throw new Error(`There is no readable ${KIND_LABEL[q.pdfType] || q.pdfType} PDF for ${q.district} (available: ${have}).${blocked}`);
-  }
-  return { file, notes };
+  const near = similarNames(readable.flatMap((f) => f.names.flatMap((n) => [n, splitSectionName(n).village])), q.village);
+  return failure('not_found', 'village_not_found',
+    `Exact Match Not Found: village "${q.village}"${q.tps ? ` with TPS-${Number(q.tps)}` : ''} is not listed in any readable Jantri PDF of ${q.district}.${unreadableNote ? ` ${unreadableNote}` : ''}`,
+    { suggestions: near.map((n) => manual('similar_village_name', n)) });
 }
 
 // Dropdown data for one district: each PDF kind with its talukas, villages and TPS numbers.
 function places(district) {
-  const files = filesForDistrict(district).filter((f) => f.kind)
+  const files = filesForDistrict(district).filter((f) => f.kind && f.kind !== 'RURAL_AGRI') // listed under "village"
     .sort((a, b) => KIND_ORDER.indexOf(a.kind) - KIND_ORDER.indexOf(b.kind));
   return files.map((f) => {
     let index = [];
@@ -112,13 +138,15 @@ function places(district) {
     const talukas = new Map();
     for (const page of index) {
       if (!page.name) continue;
-      const m = f.kind === 'RURAL_NA' ? null : page.name.match(/^(.*?)\s*TPS\s*-?\s*0*(\d+)\s*$/i);
-      const village = m ? m[1].trim() : page.name;
+      // "KOSAD TPS-66" is offered as village KOSAD + TPS 66; any other name is offered whole, as printed
+      const section = /^RURAL/.test(f.kind) ? { simple: false, tpScheme: false } : splitSectionName(page.name);
+      const village = section.simple ? section.village : page.name;
       if (!talukas.has(page.taluka)) talukas.set(page.taluka, new Map());
       const villages = talukas.get(page.taluka);
-      if (!villages.has(village)) villages.set(village, { name: village, tps: new Set(), plain: false });
-      if (m) villages.get(village).tps.add(m[2]);
+      if (!villages.has(village)) villages.set(village, { name: village, tps: new Set(), plain: false, fpList: false });
+      if (section.simple) villages.get(village).tps.add(section.tps);
       else villages.get(village).plain = true;
+      if (!section.simple && section.tpScheme) villages.get(village).fpList = true; // a TP scheme section: numbers are FP numbers
     }
     return {
       kind: f.kind,
@@ -127,7 +155,7 @@ function places(district) {
       talukas: [...talukas.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([name, villages]) => ({
         name,
         villages: [...villages.values()].sort((a, b) => a.name.localeCompare(b.name))
-          .map((v) => ({ name: v.name, plain: v.plain, tps: [...v.tps].sort((a, b) => a - b) })),
+          .map((v) => ({ name: v.name, plain: v.plain, fpList: v.fpList, tps: [...v.tps].sort((a, b) => a - b) })),
       })),
     };
   });
@@ -137,4 +165,4 @@ function districts() {
   return [...new Set(loadCatalog().map((f) => f.row).filter(Boolean))];
 }
 
-module.exports = { CATALOG_FILE, KIND_LABEL, loadCatalog, choosePdf, districts, places };
+module.exports = { CATALOG_FILE, KIND_LABEL, loadCatalog, resolvePdf, districts, places };

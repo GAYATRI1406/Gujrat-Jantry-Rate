@@ -1,19 +1,40 @@
 import React, { useEffect, useState } from 'react';
-import { FIELDS, PDF_TYPES, PROPERTY_TYPES, STATUS } from './constants.js';
+import { AREA_UNITS, FIELDS, PDF_TYPES, PROPERTY_TYPES, STATUS, TYPES_BY_AREA } from './constants.js';
+
+const rupees = (n) => `₹ ${Number(n).toLocaleString('en-IN')}`;
 
 function missingFields(f) {
   const missing = [];
   if (!f.district) missing.push('District');
   if (!f.village) missing.push('Village');
   if (!f.propertyType) missing.push('Property type');
-  if (f.pdfType !== 'RURAL_NA' && f.tps && !f.fp) missing.push('FP No.');
-  if ((f.pdfType === 'RURAL_NA' || !f.tps) && !f.rsNo && !f.blNo) missing.push('Survey No. or BL No.');
+  if (f.tps && !f.fp && !f.rsNo) missing.push('FP No.');
+  if (!f.tps && !f.rsNo && !f.blNo && !f.fp) missing.push('Survey No.');
+  if (f.area && !(Number(f.area) > 0)) missing.push('a valid area');
   return missing;
+}
+
+// Optional property area, used to work out the government value.
+function AreaFields({ f, set, disabled }) {
+  return (
+    <>
+      <label>
+        <span>Property area (optional)</span>
+        <input value={f.area || ''} onChange={set('area')} disabled={disabled} inputMode="decimal" />
+      </label>
+      <label>
+        <span>Area unit</span>
+        <select value={f.areaUnit || 'sqmt'} onChange={set('areaUnit')} disabled={disabled}>
+          {Object.entries(AREA_UNITS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+        </select>
+      </label>
+    </>
+  );
 }
 
 // Editable summary of what was read from a typed address.
 export function DetailsCard({ initial, disabled, districts, onSearch }) {
-  const [f, setF] = useState(() => ({ ...initial, propertyType: initial.propertyType || '' }));
+  const [f, setF] = useState(() => ({ ...initial, propertyType: initial.propertyType || '', pdfType: initial.pdfType || '', areaUnit: 'sqmt' }));
   const set = (key) => (e) => setF((old) => ({ ...old, [key]: e.target.value }));
   const missing = missingFields(f);
 
@@ -25,7 +46,7 @@ export function DetailsCard({ initial, disabled, districts, onSearch }) {
         {FIELDS.map(([key, label]) => (
           <label key={key}>
             <span>{label}</span>
-            <input value={f[key] || ''} onChange={set(key)} disabled={disabled} placeholder="-" list={key === 'district' ? 'districts' : undefined} />
+            <input value={f[key] || ''} onChange={set(key)} disabled={disabled} list={key === 'district' ? 'districts' : undefined} />
           </label>
         ))}
         <label>
@@ -36,11 +57,13 @@ export function DetailsCard({ initial, disabled, districts, onSearch }) {
           </select>
         </label>
         <label className="wide">
-          <span>PDF to search</span>
+          <span>Area type</span>
           <select value={f.pdfType} onChange={set('pdfType')} disabled={disabled}>
+            <option value="">Find automatically from the village</option>
             {Object.entries(PDF_TYPES).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
           </select>
         </label>
+        <AreaFields f={f} set={set} disabled={disabled} />
       </div>
       {missing.length > 0 && <p className="hint">Still needed: {missing.join(', ')}</p>}
       <button className="primary" disabled={disabled || missing.length > 0} onClick={() => onSearch(f)}>
@@ -50,7 +73,7 @@ export function DetailsCard({ initial, disabled, districts, onSearch }) {
   );
 }
 
-const EMPTY = { district: '', pdfType: '', taluka: '', village: '', tps: '', fp: '', rsNo: '', blNo: '', propertyType: '' };
+const EMPTY = { district: '', pdfType: '', taluka: '', village: '', tps: '', fp: '', rsNo: '', blNo: '', propertyType: '', area: '', areaUnit: 'sqmt' };
 
 // Pick everything from lists: District -> Area type -> Taluka -> Village -> TPS, then type the plot number.
 export function SelectCard({ districts, disabled, onSearch }) {
@@ -79,12 +102,15 @@ export function SelectCard({ districts, disabled, onSearch }) {
   const village = taluka?.villages.find((v) => v.name === f.village);
   const urban = f.pdfType && f.pdfType !== 'RURAL_NA';
   const hasTps = urban && village && village.tps.length > 0;
+  // a TP scheme section (chosen by TPS number, or an Ahmedabad-style section name) lists FP numbers
+  const askFp = Boolean(f.tps) || Boolean(urban && village?.fpList);
+  const types = TYPES_BY_AREA[f.pdfType] || Object.keys(PROPERTY_TYPES);
 
   // changing a field clears everything that depends on it
   const pick = (key, reset) => (e) => setF((old) => ({ ...old, ...reset, [key]: e.target.value }));
   const below = {
-    district: { pdfType: '', taluka: '', village: '', tps: '', fp: '', rsNo: '', blNo: '' },
-    pdfType: { taluka: '', village: '', tps: '', fp: '', rsNo: '', blNo: '' },
+    district: { pdfType: '', taluka: '', village: '', tps: '', fp: '', rsNo: '', blNo: '', propertyType: '' },
+    pdfType: { taluka: '', village: '', tps: '', fp: '', rsNo: '', blNo: '', propertyType: '' },
     taluka: { village: '', tps: '', fp: '', rsNo: '', blNo: '' },
     village: { tps: '', fp: '', rsNo: '', blNo: '' },
     tps: { fp: '', rsNo: '', blNo: '' },
@@ -139,7 +165,7 @@ export function SelectCard({ districts, disabled, onSearch }) {
             </select>
           </label>
         )}
-        {f.tps ? (
+        {askFp ? (
           <label className="wide">
             <span>FP No. (Final Plot)</span>
             <input value={f.fp} onChange={pick('fp')} disabled={off || !village} placeholder="e.g. 327" inputMode="numeric" />
@@ -147,11 +173,11 @@ export function SelectCard({ districts, disabled, onSearch }) {
         ) : (
           <>
             <label>
-              <span>{urban ? 'Survey / City Survey No.' : 'RS No.'}</span>
+              <span>{urban ? 'Survey / City Survey No.' : 'Survey (RS) No.'}</span>
               <input value={f.rsNo} onChange={pick('rsNo')} disabled={off || !village} placeholder="e.g. 398" />
             </label>
             <label>
-              <span>BL No. (optional)</span>
+              <span>Block No. (optional)</span>
               <input value={f.blNo} onChange={pick('blNo')} disabled={off || !village} placeholder="e.g. 581" />
             </label>
           </>
@@ -160,9 +186,10 @@ export function SelectCard({ districts, disabled, onSearch }) {
           <span>Property type</span>
           <select value={f.propertyType} onChange={pick('propertyType')} disabled={off}>
             <option value="">Select property type</option>
-            {Object.entries(PROPERTY_TYPES).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
+            {types.map((k) => <option key={k} value={k}>{PROPERTY_TYPES[k]}</option>)}
           </select>
         </label>
+        <AreaFields f={f} set={(key) => pick(key)} disabled={off} />
       </div>
       {f.district && !loading && !kinds.length && <p className="hint">No readable PDF for this district.</p>}
       {f.village && missing.length > 0 && <p className="hint">Still needed: {missing.join(', ')}</p>}
@@ -192,38 +219,80 @@ export function ProgressCard({ steps, done, failed }) {
   );
 }
 
+// Near misses and competing entries. Shown for information only - never as the property's rate.
+function Alternatives({ title, items }) {
+  if (!items?.length) return null;
+  return (
+    <div className="alternatives">
+      <h4>{title}</h4>
+      <p className="warning">Not verified. Check each one by hand before using it.</p>
+      <ul>
+        {items.map((s, i) => (
+          <li key={i}>
+            <span>{s.description}</span>
+            {s.rate != null && <em>{rupees(s.rate)} per sq. mt.{s.rateCategory ? ` (${s.rateCategory})` : ''}</em>}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 export function ResultCard({ result, screenshots, onZoom }) {
-  const status = STATUS[result.status] || STATUS.no_data;
+  const status = STATUS[result.status] || STATUS.error;
   const q = result.query || {};
+  const verified = result.status === 'verified';
   const rows = [
-    ['PDF', result.pdf],
+    ['Source document', result.pdf],
     ['Section', result.section],
     ['Page', result.page],
     ['Zone', result.zone],
-    ['Matched by', result.matched && `${result.matched.field} ${result.matched.value}${result.matched.how === 'neighbour' ? ` (used ${result.matched.found})` : ''}`],
-    ['Property type', PROPERTY_TYPES[q.propertyType]],
+    ['Matched entry', result.matched && `${result.matched.field} ${result.matched.found}${result.listLabel ? ` (list: ${result.listLabel})` : ''}`],
+    ['Property type', PROPERTY_TYPES[q.propertyType] || q.propertyType],
   ].filter(([, v]) => v);
 
   return (
     <div className="card result">
       <span className={`badge ${status.tone}`}>{status.label}</span>
-      {result.rate != null ? (
+      {verified ? (
         <div className="rate">
-          <strong>&#8377; {result.rate.toLocaleString('en-IN')}</strong>
-          <span>per sq. mt. &middot; {result.rateLabel}</span>
+          <strong>{rupees(result.rate)}</strong>
+          <span>per sq. mt. &middot; {result.rateLabel} &middot; Jantri 2011</span>
+          {result.ratePerAcre != null && <span>Also printed as {rupees(result.ratePerAcre)} per acre</span>}
         </div>
       ) : (
         <div className="rate none"><strong>{result.message}</strong></div>
       )}
-      {result.needsReview && <p className="review">Needs a manual check - see the notes below.</p>}
+      {!verified && <p className="review">No rate is returned for this property. Manual verification is required.</p>}
 
-      <dl>
-        {rows.map(([k, v]) => <React.Fragment key={k}><dt>{k}</dt><dd>{v}</dd></React.Fragment>)}
-      </dl>
+      {result.valuation && (
+        <div className="valuation">
+          <h4>Government value</h4>
+          <dl>
+            <dt>Property area</dt>
+            <dd>{result.area.areaSqmt.toLocaleString('en-IN', { maximumFractionDigits: 4 })} Sq. Mtr.{result.area.conversion ? ` (${result.area.conversion})` : ''}</dd>
+            <dt>Jantri rate</dt><dd>{rupees(result.rate)} per Sq. Mtr.</dd>
+            <dt>Calculation</dt><dd>{result.valuation.calculation}</dd>
+            <dt>Government value</dt><dd><strong>{rupees(result.valuation.governmentValue)}</strong></dd>
+          </dl>
+          <p className="fineprint">{result.valuation.formula}. No other charges or factors are applied.</p>
+        </div>
+      )}
+      {verified && result.area == null && <p className="fineprint">Add the property area to get the government value.</p>}
 
-      {Object.keys(result.values || {}).length > 0 && (
+      {rows.length > 0 && (
+        <dl>
+          {rows.map(([k, v]) => <React.Fragment key={k}><dt>{k}</dt><dd>{v}</dd></React.Fragment>)}
+          {result.source && <><dt>Source link</dt><dd><a href={result.source.url} target="_blank" rel="noreferrer">{result.source.url}</a></dd></>}
+        </dl>
+      )}
+
+      <Alternatives title="Entries that list this number" items={result.candidates} />
+      <Alternatives title="Suggestions" items={result.suggestions} />
+
+      {verified && Object.keys(result.values || {}).length > 0 && (
         <details>
-          <summary>All rates in this row</summary>
+          <summary>All rates in this entry</summary>
           <dl>
             {Object.entries(result.values).map(([k, v]) => <React.Fragment key={k}><dt>{k}</dt><dd>{v.toLocaleString('en-IN')}</dd></React.Fragment>)}
           </dl>
@@ -236,7 +305,10 @@ export function ResultCard({ result, screenshots, onZoom }) {
         <figure key={s.url}>
           <img src={s.url} alt={s.caption} onClick={() => onZoom(s.url)} />
           <figcaption>
-            <span>{s.caption} &middot; page {s.page}</span>
+            <span>
+              {s.caption} &middot; page {s.page}
+              {s.role === 'match' && verified && (s.checked ? ' · highlighted cell matches the rate' : '')}
+            </span>
             <button className="link" onClick={() => onZoom(s.pageUrl)}>Full page</button>
           </figcaption>
         </figure>

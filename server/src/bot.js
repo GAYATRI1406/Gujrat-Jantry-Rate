@@ -4,10 +4,12 @@ const fs = require('fs');
 const path = require('path');
 const { chromium } = require('playwright-core');
 const config = require('./config');
-const { pickLink, readBlogLinks, saveLinks, loadLinks, downloadPdf, fileNameOf } = require('./pdfSource');
+const { readBlogLinks, saveLinks, loadLinks, downloadPdf, fileNameOf } = require('./pdfSource');
 const { openPdf } = require('./pdfIndex');
 const { lookup } = require('./lookup');
-const { choosePdf, KIND_LABEL } = require('./catalog');
+const { resolvePdf, KIND_LABEL } = require('./catalog');
+const { applyValuation, failureResult } = require('./service');
+const { twinPath } = require('./textTwin');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const pause = (factor = 1) => sleep(config.STEP_DELAY * factor);
@@ -106,11 +108,79 @@ async function stitch(page, pngs) {
   return Buffer.from(dataUrl.split(',')[1], 'base64');
 }
 
-// job: { id, query }   emit: (message) => void, emit.frame: (jpegBuffer) => void
+const ORIGIN = `http://127.0.0.1:${config.PORT}`;
+
+// Arguments for the viewer: the PDF to show, its name, and the readable copy to check text against (if any).
+function viewerArgs(name) {
+  const twin = fs.existsSync(twinPath(name)) ? `/pdfs/_text/${encodeURIComponent(name)}` : null;
+  return [`/pdfs/${encodeURIComponent(name)}`, name, twin];
+}
+
+// Highlights each piece of evidence in the viewer and saves it as PNG files.
+// For a verified rate it also reads back the text under the highlighted cell: `checked` is true only
+// when that text is the very number being returned, so the screenshot is proven to match the rate.
+async function captureEvidence(page, result, jobId, { paced = false, step = () => {} } = {}) {
+  const shots = [];
+  for (const [i, ev] of result.evidence.entries()) {
+    await page.evaluate((n) => window.JV.show(n), ev.page);
+    await page.evaluate((rects) => window.JV.mark(rects), ev.rects);
+    if (i === 0) step(ev.role === 'match' ? `Entry found on page ${ev.page} - highlighting it` : `Showing page ${ev.page} (${ev.role}, not verified)`);
+    if (paced) await pause(1.3);
+
+    let checked = false;
+    if (ev.expect !== null && ev.expect !== undefined) {
+      const cell = ev.rects.find((r) => r.kind === 'value');
+      const printed = await page.evaluate((r) => window.JV.textIn(r), cell);
+      checked = printed.replace(/\D/g, '') === String(ev.expect);
+    }
+
+    step('Taking the screenshot', 'shot');
+    const name = `${jobId}-${i + 1}`;
+    // one image = the page's column titles + the matched block
+    const strips = [];
+    for (const kind of ['head', 'block']) {
+      const mark = page.locator(`.mark.${kind}`).first();
+      if (await mark.count()) strips.push(await mark.screenshot());
+    }
+    fs.writeFileSync(path.join(config.SHOTS_DIR, `${name}.png`), strips.length > 1 ? await stitch(page, strips) : strips[0]);
+    await page.locator('#sheet').screenshot({ path: path.join(config.SHOTS_DIR, `${name}-page.png`) });
+    shots.push({ url: `/shots/${name}.png`, pageUrl: `/shots/${name}-page.png`, page: ev.page, caption: ev.caption, role: ev.role, checked });
+  }
+  if (shots.length) step(`Screenshot saved (${shots.length})`, 'shot');
+  return shots;
+}
+
+// A verified rate must come with a screenshot whose highlighted cell shows that same number.
+// If that cannot be proven, the rate is withdrawn rather than returned unverified.
+function enforceEvidence(result, shots) {
+  if (result.status !== 'verified') return result;
+  if (shots[0] && shots[0].role === 'match' && shots[0].checked) return result;
+  result.notes.push(`The lookup read Rs. ${result.rate}, but the screenshot check could not confirm it.`);
+  return Object.assign(result, {
+    status: 'error', reason: 'evidence_check_failed', rate: null, rateLabel: null,
+    message: 'The rate could not be confirmed against the source page. Manual verification is required.',
+  });
+}
+
+// Evidence for the API: same screenshots, no live view and no pauses.
+async function quickEvidence(result, jobId) {
+  if (!result.evidence.length) return [];
+  const browser = await getBrowser();
+  const context = await browser.newContext({ viewport: config.VIEWPORT, deviceScaleFactor: 2 });
+  try {
+    const page = await context.newPage();
+    await page.goto(`${ORIGIN}/viewer.html`, { waitUntil: 'load' });
+    await page.evaluate((args) => window.JV.open(...args), viewerArgs(result.pdf));
+    return await captureEvidence(page, result, jobId);
+  } finally {
+    await context.close().catch(() => {});
+  }
+}
+
+// job: { id, query, area }   emit: (message) => void, emit.frame: (jpegBuffer) => void
 async function runJob(job, emit) {
   const q = job.query;
   const step = (text, key) => emit({ type: 'step', text, key });
-  const origin = `http://127.0.0.1:${config.PORT}`;
 
   step('Starting the browser');
   const browser = await getBrowser();
@@ -127,7 +197,7 @@ async function runJob(job, emit) {
   });
 
   try {
-    // 1. Open the blog page and find the PDF link for this district
+    // 1. Open the blog page that lists the PDFs
     step('Opening the Gujarat Jantri website');
     emit({ type: 'url', url: config.BLOG_URL });
     let links = [];
@@ -140,24 +210,18 @@ async function runJob(job, emit) {
       step(`Website did not load (${err.message.split('\n')[0]}) - using the saved link list`);
     }
     if (!links.length) links = loadLinks();
-    if (!links.length) throw new Error('Could not read the PDF links from the website.');
 
     // Which PDF holds this property: decided from what is inside the PDFs, not from the file names
-    let link;
-    let pdfNotes = [];
-    try {
-      const chosen = choosePdf(q);
-      q.pdfType = chosen.file.kind;
-      pdfNotes = chosen.notes;
-      link = links.find((l) => l.href === chosen.file.href) || { href: chosen.file.href };
-    } catch (err) {
-      // district not in the catalog (not built yet, or new on the website): go by the file name
-      link = pickLink(links, q.district, q.pdfType);
-      if (!link) throw err;
+    const resolved = resolvePdf(q);
+    if (resolved.failure) {
+      step('No PDF can be searched for these details');
+      await pause();
+      return { result: applyValuation(failureResult(q, resolved.failure), job.area), screenshots: [], file: null };
     }
-    const typeLabel = KIND_LABEL[q.pdfType] || q.pdfType;
-    step(`Looking for the ${q.district} ${typeLabel} PDF link`);
-    if (!link) throw new Error(`The website has no ${typeLabel} PDF for district "${q.district}".`);
+    const file = resolved.file;
+    q.pdfType = file.kind;
+    const link = links.find((l) => l.href === file.href) || { href: file.href };
+    step(`Looking for the ${file.district} ${KIND_LABEL[file.kind]} PDF link`);
     await pointAtLink(page, link).catch(() => {});
 
     // 2. Download the PDF (kept on disk for next time)
@@ -172,8 +236,8 @@ async function runJob(job, emit) {
     // 3. Open it in the viewer
     step('Opening the PDF');
     emit({ type: 'url', url: link.href });
-    await page.goto(`${origin}/viewer.html`, { waitUntil: 'load' });
-    const pageCount = await page.evaluate(([url, name]) => window.JV.open(url, name), [`/pdfs/${encodeURIComponent(pdf.name)}`, pdf.name]);
+    await page.goto(`${ORIGIN}/viewer.html`, { waitUntil: 'load' });
+    const pageCount = await page.evaluate((args) => window.JV.open(...args), viewerArgs(pdf.name));
     await pause();
 
     // 4. Find the section, the number and the rate
@@ -185,7 +249,7 @@ async function runJob(job, emit) {
     } finally {
       await doc.destroy();
     }
-    result.notes.unshift(...pdfNotes);
+    result.notes.unshift(...resolved.notes);
     step(`Read ${pageCount} pages`, 'read');
 
     // 5. Replay the search in the live view
@@ -203,50 +267,28 @@ async function runJob(job, emit) {
       step(`Searching for ${term}`);
       await typeSearch(page, term);
     }
-
-    const shots = [];
     const main = result.evidence[0];
     if (main) {
-      // flip through the section pages up to the one with the match
+      // flip through the section pages up to the one with the entry
       const between = result.sectionPages.filter((p) => p > result.sectionPages[0] && p < main.page).slice(-4);
       for (const p of between) {
         await page.evaluate((n) => window.JV.show(n), p);
         await pause(0.5);
       }
+    } else {
+      step(result.status === 'not_found' ? 'Exact match not found' : 'Nothing to highlight');
     }
-    for (const [i, ev] of result.evidence.entries()) {
-      await page.evaluate((n) => window.JV.show(n), ev.page);
-      await page.evaluate((rects) => window.JV.mark(rects), ev.rects);
-      if (i === 0) step(`Match found on page ${ev.page} - highlighting it`);
-      await pause(1.3);
-      step('Taking the screenshot', 'shot');
-      const name = `${job.id}-${i + 1}`;
-      // evidence = the page's column titles + the matched block, as one image
-      const strips = [];
-      for (const kind of ['head', 'block']) {
-        const mark = page.locator(`.mark.${kind}`).first();
-        if (await mark.count()) strips.push(await mark.screenshot());
-      }
-      fs.writeFileSync(path.join(config.SHOTS_DIR, `${name}.png`), strips.length > 1 ? await stitch(page, strips) : strips[0]);
-      await page.locator('#sheet').screenshot({ path: path.join(config.SHOTS_DIR, `${name}-page.png`) });
-      shots.push({ url: `/shots/${name}.png`, pageUrl: `/shots/${name}-page.png`, page: ev.page, caption: ev.caption });
-    }
-    if (!result.evidence.length) {
-      step('No matching entry to highlight');
-      await pause();
-      const name = `${job.id}-1`;
-      await page.screenshot({ path: path.join(config.SHOTS_DIR, `${name}.png`) });
-      shots.push({ url: `/shots/${name}.png`, pageUrl: `/shots/${name}.png`, page: result.sectionPages[0] || 1, caption: 'Nothing matched - current view' });
-    }
-    if (shots.length) step(`Screenshot saved (${shots.length})`, 'shot');
-    await pause();
 
+    const shots = await captureEvidence(page, result, job.id, { paced: true, step });
+    await pause();
+    enforceEvidence(result, shots);
+    applyValuation(result, job.area);
     delete result.evidence;
-    return { result, screenshots: shots, pdfUrl: link.href };
+    return { result, screenshots: shots, file };
   } finally {
     await cdp.send('Page.stopScreencast').catch(() => {});
     await context.close().catch(() => {});
   }
 }
 
-module.exports = { runJob, getBrowser };
+module.exports = { runJob, getBrowser, quickEvidence, enforceEvidence };

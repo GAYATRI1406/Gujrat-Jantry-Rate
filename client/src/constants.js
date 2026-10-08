@@ -2,9 +2,18 @@ export const PROPERTY_TYPES = {
   flat: 'Flat / Apartment',
   shop: 'Shop',
   office: 'Office',
-  residential: 'Open land / Plot - Residential',
-  industrial: 'Open land - Industrial',
+  residential: 'Residential plot / open land',
   commercial: 'Commercial',
+  industrial: 'Industrial plot / land',
+  agri_irrigated: 'Agricultural - irrigated',
+  agri_non_irrigated: 'Agricultural - non irrigated',
+};
+
+// the rate columns each kind of PDF actually has
+export const TYPES_BY_AREA = {
+  CORPORATION: ['flat', 'shop', 'office', 'residential', 'industrial', 'agri_irrigated', 'agri_non_irrigated'],
+  NAGARPALIKA: ['flat', 'shop', 'office', 'residential', 'industrial', 'agri_irrigated', 'agri_non_irrigated'],
+  RURAL_NA: ['residential', 'commercial', 'industrial', 'agri_irrigated', 'agri_non_irrigated'],
 };
 
 export const PDF_TYPES = {
@@ -13,23 +22,23 @@ export const PDF_TYPES = {
   RURAL_NA: 'Rural NA (village)',
 };
 
-export const STATUS = {
-  found: { label: 'Rate found', tone: 'ok' },
-  fallback: { label: 'Fallback value used', tone: 'warn' },
-  no_data: { label: 'No data found', tone: 'bad' },
-  insufficient: { label: 'Insufficient data found', tone: 'bad' },
+export const AREA_UNITS = {
+  sqmt: 'Sq. Mtr.',
+  sqft: 'Sq. Ft.',
+  sqyd: 'Sq. Yd.',
+  guntha: 'Guntha',
+  acre: 'Acre',
+  hectare: 'Hectare',
 };
 
-export const SAMPLES = [
-  {
-    label: 'Kosad flat (Corporation)',
-    text: 'Moje Kosad, RS No. 582-1, BL No. 1072 Paiki 1, TPS No. 66 (Kosad-Variyav), FP No. 327, Ashirwad Heights, Building No. J, 14th Floor, Flat No. 1404, Tal. Surat City (Adajan), Dist. Surat',
-  },
-  {
-    label: 'Sayan plot (Rural NA)',
-    text: 'Moje Sayan, RS No. 398, BL No. 581, Royal Residency, Plot No. 25/B, Tal. Olpad, Dist. Surat',
-  },
-];
+export const STATUS = {
+  verified: { label: 'Verified rate', tone: 'ok' },
+  not_found: { label: 'Exact Match Not Found', tone: 'bad' },
+  ambiguous: { label: 'Ambiguous - manual verification required', tone: 'warn' },
+  rate_not_available: { label: 'Rate not available', tone: 'warn' },
+  unsupported: { label: 'Not supported', tone: 'bad' },
+  error: { label: 'Could not be verified', tone: 'bad' },
+};
 
 export const FIELDS = [
   ['district', 'District'],
@@ -37,6 +46,6 @@ export const FIELDS = [
   ['village', 'Village / Moje'],
   ['tps', 'TPS No.'],
   ['fp', 'FP No.'],
-  ['rsNo', 'RS / City Survey No.'],
-  ['blNo', 'BL No.'],
+  ['rsNo', 'Survey / RS No.'],
+  ['blNo', 'Block No.'],
 ];

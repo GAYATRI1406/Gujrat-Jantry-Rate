@@ -7,11 +7,13 @@
     "dev": "node --watch src/index.js",
     "start": "node src/index.js",
     "sync": "node scripts/sync.js",
-    "selftest": "node scripts/selftest.js"
+    "selftest": "node scripts/selftest.js",
+    "report": "node scripts/report.js"
   },
   "dependencies": {
     "express": "^4.19.2",
     "mongoose": "^8.5.1",
+    "pdf-lib": "^1.17.1",
     "pdfjs-dist": "3.11.174",
     "playwright-core": "^1.47.0",
     "ws": "^8.18.0"

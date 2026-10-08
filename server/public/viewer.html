@@ -44,11 +44,15 @@
   const canvas = document.getElementById('canvas');
   let doc = null;
   let view = null; // { scale, height } of the page on screen, in PDF points
+  let current = null; // the pdf.js page on screen
+  let textDoc = null; // the document text is read from (the same one unless a readable copy is given)
 
   // Controlled by the bot through Playwright.
   window.JV = {
-    async open(url, name) {
+    // textUrl: a copy of the same PDF with readable text, for PDFs whose own text is not (see textTwin.js)
+    async open(url, name, textUrl) {
       doc = await pdfjsLib.getDocument({ url }).promise;
+      textDoc = textUrl ? await pdfjsLib.getDocument({ url: textUrl }).promise : doc;
       document.getElementById('name').textContent = name;
       await this.show(1);
       return doc.numPages;
@@ -56,6 +60,7 @@
 
     async show(pageNo) {
       const page = await doc.getPage(pageNo);
+      current = page;
       const base = page.getViewport({ scale: 1 });
       const scale = SHEET_WIDTH / base.width;
       const dpr = window.devicePixelRatio || 1;
@@ -85,6 +90,14 @@
       }
       const block = sheet.querySelector('.mark.block');
       if (block) block.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    },
+
+    // text printed inside a rect of the page on screen (same PDF-point coordinates as mark)
+    async textIn(r) {
+      const content = await (await textDoc.getPage(current.pageNumber)).getTextContent();
+      return content.items
+        .filter((i) => i.transform[4] >= r.x - 1 && i.transform[4] <= r.x + r.w + 1 && i.transform[5] >= r.bottom - 1 && i.transform[5] <= r.top + 1)
+        .map((i) => i.str).join('');
     },
 
     clear() {

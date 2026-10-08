@@ -1,41 +1,70 @@
-// Decision logic from 01-flow-logic-spec.md.
-//   Flow A - Corporation PDF: TPS section -> FP No. -> rate column by property type
-//   Flow B - Rural NA PDF:    village section -> RS No. -> BL No. -> Gamtal baseline rate
-const { getIndex, parseCorpSection, parseNaSection } = require('./pdfIndex');
+// Strict Jantri lookup (Task 2). Accuracy comes first:
+//   - a rate is "verified" only when the given number is listed exactly once in the right village
+//     section, in the right kind of list, and the rate cell for the property type is filled
+//   - anything else returns no rate; near misses are offered only as suggestions that need manual checking
+//
+//   Flow A - Corporation / Nagarpalika PDF: village (+ TPS) section -> FP No. or Survey No. -> rate column
+//   Flow B - Rural NA PDF:                  village section -> Survey No. -> rate column
+//   Flow C - Rural Agri PDF:                village section -> Survey No. -> irrigated / non-irrigated rate
+const { getIndex, parseCorpSection, parseNaSection, parseAgriSection } = require('./pdfIndex');
+const { nameKey, splitSectionName } = require('./names');
 
-const NO_DATA = 'No data found';
-const INSUFFICIENT = 'Insufficient data found';
+const NOT_FOUND = 'Exact Match Not Found';
+const RATE_UNIT = 'sqmt';
 
 const PROPERTY_TYPES = {
   flat: 'Flat / Apartment',
   shop: 'Shop',
   office: 'Office',
-  residential: 'Open land / Plot - Residential',
-  industrial: 'Open land - Industrial',
+  residential: 'Residential plot / open land',
   commercial: 'Commercial',
+  industrial: 'Industrial plot / land',
+  agri_irrigated: 'Agricultural - irrigated',
+  agri_non_irrigated: 'Agricultural - non irrigated',
+  // general words an API caller may send; they need a more specific type in city / town tables
+  residential_any: 'Residential',
+  agricultural: 'Agricultural',
 };
 
-const CORP_COLUMN_LABELS = {
-  2: 'Open land (plot) rate',
+const URBAN_COLUMNS = {
+  2: 'Open plot (land) rate',
   3: 'Residential flat / apartment',
   4: 'Office',
   5: 'Shop',
-  6: 'Open land rate - industrial',
+  6: 'Open plot rate - industrial',
   7: 'Agricultural land - irrigated',
   8: 'Agricultural land - non irrigated',
 };
-const CORP_COLUMN_FOR_TYPE = { residential: 2, flat: 3, office: 4, shop: 5, industrial: 6 };
-const NA_COLUMN_LABELS = { residential: 'Residential', commercial: 'Commercial', industrial: 'Industrial' };
+// which rate column(s) a property type can mean; more than one = the type is too general to verify
+const URBAN_COLUMNS_FOR_TYPE = {
+  flat: [3], office: [4], shop: [5], residential: [2], industrial: [6],
+  agri_irrigated: [7], agri_non_irrigated: [8],
+  residential_any: [2, 3], commercial: [4, 5], agricultural: [7, 8],
+};
+const RURAL_COLUMNS = { residential: 'Residential', commercial: 'Commercial', industrial: 'Industrial' };
+const RURAL_COLUMNS_FOR_TYPE = {
+  residential: ['residential'], residential_any: ['residential'], commercial: ['commercial'], industrial: ['industrial'],
+};
+const AGRI_COLUMNS = {
+  non_irrigated: 'Agricultural land - non irrigated', irrigated: 'Agricultural land - irrigated',
+  kharaba: 'Uncultivable land (kharaba)', mineral: 'Mineral-bearing land',
+};
+const AGRI_COLUMNS_FOR_TYPE = {
+  agri_non_irrigated: ['non_irrigated'], agri_irrigated: ['irrigated'], agricultural: ['non_irrigated', 'irrigated'],
+};
+// the two village tables: non-agricultural land (Rural NA) and agricultural land (Rural Agri)
+const RURAL_TABLES = {
+  RURAL_NA: { flow: 'B', parse: parseNaSection, columns: RURAL_COLUMNS, columnsForType: RURAL_COLUMNS_FOR_TYPE },
+  RURAL_AGRI: { flow: 'C', parse: parseAgriSection, columns: AGRI_COLUMNS, columnsForType: AGRI_COLUMNS_FOR_TYPE },
+};
 
-const nameKey = (s) => String(s || '').toUpperCase().replace(/\(.*?\)/g, '').replace(/[^A-Z0-9]/g, '');
-// some districts print numbers as "-/39" (nothing before the slash) - that is plain 39
-const numKey = (s) => String(s || '').toUpperCase().replace(/\s+/g, '').replace(/^-+\/?/, '').replace(/-/g, '/');
+const FIELD_LABEL = { fp: 'FP No.', rsNo: 'Survey No.', blNo: 'Block No.' };
+
+// "582-1" and "582/1" are the same number; "-/39" (nothing before the slash) is plain 39; 066 is 66
+const numKey = (s) => String(s || '').toUpperCase().replace(/\s+/g, '').replace(/^-+\/?/, '').replace(/-/g, '/')
+  .replace(/(^|\/)0+(?=\d)/g, '$1');
 const baseNum = (s) => (numKey(s).match(/^\d+/) || [null])[0];
 
-function splitSectionName(name) {
-  const m = String(name).match(/^(.*?)\s*TPS\s*-?\s*0*(\d+)\s*$/i);
-  return m ? { village: m[1].trim(), tps: m[2] } : { village: String(name).trim(), tps: null };
-}
 
 function editDistance(a, b) {
   const d = Array.from({ length: a.length + 1 }, (_, i) => [i]);
@@ -48,44 +77,35 @@ function editDistance(a, b) {
   return d[a.length][b.length];
 }
 
-// Entries whose village matches; allows a small spelling difference (Kosad / Kosaad).
-function matchVillage(entries, village, notes) {
+// Names in the PDF that look like what was typed. Offered as "did you mean", never used on their own.
+function similarNames(names, village) {
   const want = nameKey(village);
-  const exact = entries.filter((e) => nameKey(e.village) === want);
-  if (exact.length || !want) return exact;
-  // town sections are often named "ANAND-CITY", "DHORAJI-1", "JAMNAGAR (1) - JMC"
-  const partial = entries.filter((e) => {
-    const k = nameKey(e.village);
-    return want.length >= 4 && k.length >= 4 && (k.startsWith(want) || want.startsWith(k));
-  });
-  if (partial.length) {
-    notes.push(`No section is named exactly "${village}" - searched ${[...new Set(partial.map((e) => e.name))].slice(0, 8).join(', ')}.`);
-    return partial;
-  }
-  let best = null;
-  for (const key of new Set(entries.map((e) => nameKey(e.village)))) {
-    const dist = editDistance(want, key);
-    if (dist <= 2 && key.length > 4 && (!best || dist < best.dist)) best = { key, dist };
-  }
-  if (!best) return [];
-  const close = entries.filter((e) => nameKey(e.village) === best.key);
-  notes.push(`Village "${village}" is not spelled that way in the PDF - used the closest name "${close[0].village}".`);
-  return close;
+  if (want.length < 3) return [];
+  return [...new Set(names)].filter((n) => {
+    const k = nameKey(n);
+    return k !== want && (k.startsWith(want) || want.startsWith(k) || editDistance(want, k) <= 2);
+  }).slice(0, 8);
 }
 
-// Every place a number appears in the lists: exact text first, then same base number (582-1 ~ 582, 229 ~ 229/Paiki).
-function findNumber(units, query) {
-  const want = numKey(query);
+// What kind of number a list in a city / town PDF holds, from the label printed above it.
+function listType(label) {
+  if (/block/i.test(label)) return 'block';
+  if (/F\.?\s*P|final/i.test(label)) return 'fp';
+  if (/survey|S\.?\s*NO|R\.?\s*S/i.test(label)) return 'survey';
+  return 'unknown';
+}
+const LIST_FOR_FIELD = { fp: 'fp', rsNo: 'survey', blNo: 'block' };
+
+// Units (blocks or rows) that list the number. mode 'exact' = same number; 'base' = same number before any /part.
+function unitsListing(units, query, mode, accept = () => true) {
+  const want = mode === 'exact' ? numKey(query) : baseNum(query);
+  if (!want) return [];
   const hits = [];
-  for (const how of ['exact', 'base']) {
-    if (how === 'base' && !baseNum(query)) break;
-    for (const unit of units) {
-      for (const token of unit.tokens) {
-        const ok = how === 'exact' ? numKey(token.s) === want : baseNum(token.s) === baseNum(query);
-        if (ok && !hits.some((h) => h.unit === unit)) hits.push({ unit, token, how });
-      }
-    }
-    if (hits.length) break;
+  for (const unit of units) {
+    if (!accept(unit)) continue;
+    const inRun = (t) => mode === 'exact' && t.range && /^\d+$/.test(want) && Number(want) >= t.range[0] && Number(want) <= t.range[1];
+    const token = unit.tokens.find((t) => (mode === 'exact' ? numKey(t.s) === want || inRun(t) : !t.range && baseNum(t.s) === want && numKey(t.s) !== numKey(query)));
+    if (token) hits.push({ unit, token });
   }
   return hits;
 }
@@ -94,7 +114,7 @@ function rect(kind, x, w, top, bottom) {
   return { kind, x, w, top, bottom };
 }
 
-function evidenceFor(unit, token, value, { pageWidth, heads }, caption) {
+function evidenceFor(unit, token, value, { pageWidth, heads }, caption, role) {
   const out = [];
   const pages = [...new Set([token && token.page, value && value.page].filter(Boolean))];
   for (const page of pages) {
@@ -104,227 +124,311 @@ function evidenceFor(unit, token, value, { pageWidth, heads }, caption) {
     if (heads[page]) rects.push(rect('head', 18, pageWidth - 36, heads[page].top, heads[page].bottom));
     if (token && token.page === page) rects.push(rect('token', token.x - 2, token.w + 4, token.y + 10, token.y - 3));
     if (value && value.page === page) rects.push(rect('value', value.x - 3, value.w + 6, value.y + 10, value.y - 3));
-    out.push({ page, rects, caption });
+    out.push({ page, rects, caption, role, expect: value && value.page === page ? value.v : null });
   }
   return out;
 }
 
 function baseResult(flow, q, pdfName) {
   return {
-    flow, pdf: pdfName, status: 'no_data', message: NO_DATA, rate: null, rateLabel: null,
-    section: null, sectionPages: [], page: null, zone: null, matched: null, values: {},
-    notes: [], needsReview: false, searches: [], evidence: [],
+    flow, pdf: pdfName, status: 'not_found', matchType: 'none', reason: null, message: NOT_FOUND,
+    rate: null, rateLabel: null, rateUnit: RATE_UNIT, ratePerAcre: null,
+    section: null, sectionPages: [], page: null, zone: null, listLabel: null, matched: null, values: {},
+    notes: [], suggestions: [], candidates: [], searches: [], evidence: [],
     query: q,
   };
 }
 
-async function lookupCorporation(doc, file, q, pdfName, onProgress) {
+const fail = (res, status, reason, message) => Object.assign(res, { status, reason, message });
+
+// A near miss, shown to the user as something to check by hand. Never returned as the property's rate.
+function suggestion(type, description, hit, rates, columnsForType, columnLabels, type_) {
+  const cols = columnsForType[type_] || [];
+  const cell = cols.length === 1 ? rates[cols[0]] : null;
+  return {
+    type, description, requiresManualVerification: true,
+    matchedText: hit ? hit.token.s : null,
+    zone: hit ? hit.unit.zone || null : null,
+    page: hit ? hit.token.page : null,
+    rate: cell ? cell.v : null,
+    rateCategory: cell ? columnLabels[cols[0]] : null,
+    rates: Object.fromEntries(Object.entries(rates).map(([k, c]) => [columnLabels[k], c.v])),
+  };
+}
+
+// After the row is identified: pick the rate cell for the property type, or say exactly why it cannot be verified.
+function settleRate(res, unit, token, q, columnsForType, columnLabels, section, caption) {
+  const type = q.propertyType;
+  const cols = columnsForType[type];
+  for (const [k, cell] of Object.entries(unit.values)) res.values[columnLabels[k]] = cell.v;
+  res.matchType = 'exact';
+  res.page = token.page;
+  res.zone = unit.zone || null;
+  res.listLabel = unit.label || null;
+
+  if (!cols || !cols.length) {
+    fail(res, 'unsupported', 'property_type_not_in_table',
+      `The entry was found, but this table has no rate for "${PROPERTY_TYPES[type] || type}". It lists: ${Object.values(columnLabels).join(', ')}.`);
+    res.evidence = evidenceFor(unit, token, null, section, caption, 'match');
+    return res;
+  }
+  if (cols.length > 1) {
+    fail(res, 'ambiguous', 'property_type_too_general',
+      `The entry was found, but "${PROPERTY_TYPES[type] || type}" can mean more than one rate here. Choose one: ${cols.map((c) => columnLabels[c]).join(' / ')}.`);
+    res.candidates = cols.map((c) => ({
+      type: 'rate_category', description: columnLabels[c], requiresManualVerification: true,
+      matchedText: token.s, zone: unit.zone || null, page: token.page,
+      rate: unit.values[c] ? unit.values[c].v : null, rateCategory: columnLabels[c],
+    }));
+    res.evidence = evidenceFor(unit, token, null, section, caption, 'match');
+    return res;
+  }
+
+  const cell = unit.values[cols[0]] || null;
+  if (!cell) {
+    fail(res, 'rate_not_available', 'rate_cell_empty',
+      `The entry was found, but the "${columnLabels[cols[0]]}" rate is blank in the PDF for this entry.`);
+    // the old automatic fallback (industrial -> open plot) is now only a suggestion
+    if (type === 'industrial' && unit.values[2]) {
+      res.suggestions.push({
+        type: 'other_rate_column', requiresManualVerification: true,
+        description: `The open plot rate of the same entry is ${unit.values[2].v}. It is not the industrial rate.`,
+        matchedText: token.s, zone: unit.zone || null, page: token.page, rate: unit.values[2].v, rateCategory: columnLabels[2],
+      });
+    }
+    res.evidence = evidenceFor(unit, token, null, section, caption, 'match');
+    return res;
+  }
+
+  res.status = 'verified';
+  res.reason = null;
+  res.rate = cell.v;
+  res.ratePerAcre = cell.acre || null; // agricultural tables print the rate per acre as well
+  if (token.range) res.notes.push(`The number is listed inside the run "${token.s}" (${token.range[0]} to ${token.range[1]}).`);
+  res.rateLabel = columnLabels[cols[0]];
+  res.message = `Verified: Rs. ${cell.v} per sq. mt. (${res.rateLabel})`;
+  res.evidence = evidenceFor(unit, token, cell, section, caption, 'match');
+  return res;
+}
+
+// More than one entry lists the number: nothing is verified, every place is reported.
+function settleAmbiguous(res, hits, field, value, q, columnsForType, columnLabels, section) {
+  fail(res, 'ambiguous', 'multiple_entries',
+    `${FIELD_LABEL[field]} ${value} is listed ${hits.length} times in ${res.section}. The correct entry must be chosen by hand.`);
+  res.matchType = 'multiple';
+  res.candidates = hits.map((h) => suggestion('duplicate_entry',
+    `${FIELD_LABEL[field]} ${h.token.s}${h.unit.zone ? ` in zone ${h.unit.zone}` : ''}${h.unit.label ? ` (${h.unit.label})` : ''}, page ${h.token.page}`,
+    h, h.unit.values, columnsForType, columnLabels, q.propertyType));
+  res.evidence = hits.slice(0, 3).flatMap((h) => evidenceFor(h.unit, h.token, null, section,
+    `Candidate - ${FIELD_LABEL[field]} ${h.token.s}${h.unit.zone ? `, zone ${h.unit.zone}` : ''}`, 'candidate').slice(0, 1));
+  return res;
+}
+
+// The exact number was found once, but parts of the same number (229/Paiki, 582/1) are listed elsewhere.
+// The exact entry stays verified; the related ones are pointed out so the user can check which applies.
+function noteRelated(res, related, hit, label) {
+  const others = related.filter((r) => r.unit !== hit.unit).slice(0, 4);
+  if (!others.length) return;
+  res.notes.push(`${label} ${hit.token.s} is matched exactly. Related entries are also listed: ${others.map((r) => `${r.token.s} (page ${r.token.page}${r.unit.zone ? `, zone ${r.unit.zone}` : ''})`).join(', ')}. Check that the property is not one of those parts.`);
+}
+
+// Taluka check shared by both flows: a village name that exists in several talukas needs the right taluka.
+function narrowByTaluka(res, entries, q) {
+  const talukas = [...new Set(entries.map((e) => e.taluka))];
+  if (talukas.length > 1) {
+    const mine = entries.filter((e) => nameKey(e.taluka) === nameKey(q.taluka));
+    if (!mine.length) {
+      fail(res, 'ambiguous', 'village_in_several_talukas',
+        `Village "${q.village}" exists in more than one taluka (${talukas.join(', ')}). Give the taluka exactly as listed.`);
+      res.candidates = talukas.map((t) => ({ type: 'taluka', description: t, requiresManualVerification: true }));
+      return null;
+    }
+    return mine;
+  }
+  if (q.taluka && nameKey(q.taluka) !== nameKey(talukas[0])) {
+    res.notes.push(`The PDF lists this village under taluka ${talukas[0]} (you gave "${q.taluka}").`);
+  }
+  return entries;
+}
+
+async function lookupUrban(doc, file, q, pdfName, onProgress) {
   const res = baseResult('A', q, pdfName);
-  const notes = res.notes;
   const index = (await getIndex(doc, file, q.pdfType, onProgress))
     .filter((e) => e.name)
     .map((e) => ({ ...e, ...splitSectionName(e.name) }));
+  const want = nameKey(q.village);
+  const tps = q.tps ? String(Number(q.tps)) : null;
+  const ofVillage = index.filter((e) => nameKey(e.village) === want);
+  // the full section name as printed (what the dropdowns send, and the only way to name most Ahmedabad sections)
+  const byFullName = index.filter((e) => nameKey(e.name) === want);
 
   let entries;
-  let searchKeys;
-  if (q.tps) {
-    const tps = String(Number(q.tps));
-    const sameTps = index.filter((e) => e.tps === tps);
-    entries = matchVillage(sameTps, q.village, notes);
-    if (!entries.length && sameTps.length) {
-      entries = sameTps;
-      const names = [...new Set(sameTps.map((e) => e.name))].join(', ');
-      notes.push(`TPS-${tps} is not listed under village "${q.village || '-'}" - searched ${names} instead.`);
-      res.needsReview = true;
-    }
+  let field;
+  if (byFullName.length && !(tps && ofVillage.some((e) => e.tps === tps))) {
+    entries = byFullName;
+    field = q.fp && (byFullName[0].tpScheme || !q.rsNo) ? 'fp' : q.rsNo ? 'rsNo' : 'blNo';
+    res.searches.push(String(q.village || '').toUpperCase());
+  } else if (tps) {
+    entries = ofVillage.filter((e) => e.tps === tps);
+    // a TPS section normally lists FP numbers, but a few list survey numbers (e.g. Khoraj TPS-63)
+    field = q.fp ? 'fp' : 'rsNo';
     res.searches.push(`TPS-${tps.padStart(2, '0')}`);
-    searchKeys = [['FP No.', q.fp]];
     if (!entries.length) {
-      res.message = `${NO_DATA} - TPS-${tps} section is not in ${pdfName}`;
+      const elsewhere = [...new Set(index.filter((e) => e.tps === tps).map((e) => e.name))];
+      const mine = [...new Set(ofVillage.filter((e) => e.tps).map((e) => `TPS-${e.tps}`))];
+      fail(res, 'not_found', ofVillage.length ? 'tps_not_in_village' : 'village_not_found',
+        `${NOT_FOUND}: there is no section for village "${q.village}" with TPS-${tps} in ${pdfName}.`);
+      if (mine.length) res.suggestions.push({ type: 'tps_of_village', requiresManualVerification: true, description: `Village ${q.village} has these TP schemes: ${mine.join(', ')}.` });
+      if (elsewhere.length) res.suggestions.push({ type: 'tps_in_other_village', requiresManualVerification: true, description: `TPS-${tps} is listed under: ${elsewhere.join(', ')}.` });
+      for (const n of similarNames(index.map((e) => e.village), q.village)) res.suggestions.push({ type: 'similar_village_name', requiresManualVerification: true, description: n });
       return res;
     }
   } else {
-    // No TPS number: the village's own section lists Survey No. / Block No. instead of FP No.
-    entries = matchVillage(index.filter((e) => !e.tps), q.village, notes);
-    searchKeys = [['RS No.', q.rsNo], ['BL No.', q.blNo], ['FP No.', q.fp]];
+    entries = ofVillage.filter((e) => !e.tps);
+    field = q.rsNo ? 'rsNo' : q.fp ? 'fp' : 'blNo';
     res.searches.push(String(q.village || '').toUpperCase());
     if (!entries.length) {
-      res.message = `${NO_DATA} - village "${q.village || '-'}" is not in ${pdfName}`;
+      const mine = [...new Set(ofVillage.map((e) => `TPS-${e.tps}`))];
+      fail(res, 'not_found', mine.length ? 'tps_required' : 'village_not_found', mine.length
+        ? `${NOT_FOUND}: village "${q.village}" is listed only under TP schemes (${mine.join(', ')}). Give the TPS No. and FP No.`
+        : `${NOT_FOUND}: village "${q.village}" is not listed in ${pdfName}.`);
+      for (const n of similarNames(index.map((e) => e.village), q.village)) res.suggestions.push({ type: 'similar_village_name', requiresManualVerification: true, description: n });
       return res;
     }
   }
+
+  entries = narrowByTaluka(res, entries, q);
+  if (!entries) return res;
 
   res.section = [...new Set(entries.map((e) => e.name))].join(', ');
   res.sectionPages = entries.map((e) => e.p);
   const section = await parseCorpSection(doc, res.sectionPages);
   const { blocks } = section;
+  const value = q[field];
+  res.searches.push(`${FIELD_LABEL[field]} ${value}`);
 
-  let hits = [];
-  let matched = null;
-  for (const [field, value] of searchKeys) {
-    if (!value) continue;
-    res.searches.push(`${field} ${value}`);
-    hits = findNumber(blocks, value);
-    if (hits.length) {
-      matched = { field, value, found: hits[0].token.s, how: hits[0].how };
-      break;
-    }
-    notes.push(`${field} ${value} is not listed in ${res.section}.`);
+  // only lists of the right kind count: an FP number is not looked up in a Survey No. list, and so on
+  const wantList = LIST_FOR_FIELD[field];
+  const rightList = (b) => [wantList, 'unknown'].includes(listType(b.label));
+  const hits = unitsListing(blocks, value, 'exact', rightList);
+  const caption = (h) => `Zone ${h.unit.zone || '-'} - ${h.unit.label || res.section}`;
+  const suggest = (type, text, h) => suggestion(type, text, h, h.unit.values, URBAN_COLUMNS_FOR_TYPE, URBAN_COLUMNS, q.propertyType);
+
+  if (hits.length === 1) {
+    res.matched = { field: FIELD_LABEL[field], value, found: hits[0].token.s };
+    noteRelated(res, unitsListing(blocks, value, 'base', rightList), hits[0], FIELD_LABEL[field]);
+    return settleRate(res, hits[0].unit, hits[0].token, q, URBAN_COLUMNS_FOR_TYPE, URBAN_COLUMNS, section, caption(hits[0]));
   }
+  if (hits.length > 1) return settleAmbiguous(res, hits, field, value, q, URBAN_COLUMNS_FOR_TYPE, URBAN_COLUMNS, section);
 
-  // Fallback: the FP number just before and just after
-  if (!hits.length && q.tps && q.fp && baseNum(q.fp)) {
-    const n = Number(baseNum(q.fp));
-    const before = findNumber(blocks, String(n - 1)).filter((h) => h.how === 'exact')[0];
-    const after = findNumber(blocks, String(n + 1)).filter((h) => h.how === 'exact')[0];
-    const pick = before || after;
-    if (pick) {
-      hits = [pick];
-      matched = { field: 'FP No.', value: q.fp, found: pick.token.s, how: 'neighbour' };
-      notes.push(`Used neighbouring FP No. ${pick.token.s} (zone ${pick.unit.zone || '-'}) as the fallback.`);
-      if (before && after && before.unit !== after.unit) {
-        notes.push(`FP No. ${n - 1} (zone ${before.unit.zone}) and FP No. ${n + 1} (zone ${after.unit.zone}) are in different zones - check which one applies.`);
-        res.needsReview = true;
+  // ---- no exact match: report it, and offer near misses as suggestions only ----
+  fail(res, 'not_found', 'number_not_found', `${NOT_FOUND}: ${FIELD_LABEL[field]} ${value} is not listed in ${res.section}.`);
+  const kinds = [...new Set(blocks.map((b) => listType(b.label)).filter((k) => k !== 'unknown'))];
+  if (kinds.length && !kinds.includes(wantList)) {
+    const names = { fp: 'FP numbers', survey: 'survey numbers', block: 'block numbers' };
+    res.notes.push(`This section lists ${kinds.map((k) => names[k]).join(' and ')}, not ${names[wantList]}. Search with that number instead.`);
+  }
+  for (const h of unitsListing(blocks, value, 'exact', (b) => !rightList(b))) {
+    res.suggestions.push(suggest('listed_under_other_label', `The number ${h.token.s} appears in a "${h.unit.label}" list (zone ${h.unit.zone || '-'}), which is a different kind of number.`, h));
+  }
+  for (const h of unitsListing(blocks, value, 'base', rightList).slice(0, 5)) {
+    res.suggestions.push(suggest('similar_number', `${FIELD_LABEL[field]} ${h.token.s} is listed (zone ${h.unit.zone || '-'}), not ${value}.`, h));
+  }
+  if (field === 'fp' && tps && /^\d+$/.test(numKey(value))) {
+    for (const n of [Number(value) - 1, Number(value) + 1]) {
+      for (const h of unitsListing(blocks, String(n), 'exact', rightList).slice(0, 1)) {
+        res.suggestions.push(suggest('neighbouring_fp', `Neighbouring FP No. ${h.token.s} is in zone ${h.unit.zone || '-'}. It is a different plot.`, h));
       }
     }
   }
-
-  if (!hits.length) {
-    res.message = `${NO_DATA} - number not listed in ${res.section}`;
-    return res;
+  for (const other of ['rsNo', 'blNo', 'fp'].filter((f) => f !== field && q[f])) {
+    const type = LIST_FOR_FIELD[other];
+    for (const h of unitsListing(blocks, q[other], 'exact', (b) => [type, 'unknown'].includes(listType(b.label))).slice(0, 2)) {
+      res.suggestions.push(suggest('other_identifier', `${FIELD_LABEL[other]} ${h.token.s} is listed in zone ${h.unit.zone || '-'}.`, h));
+    }
   }
-
-  const { unit: block, token } = hits[0];
-  if (hits.length > 1) {
-    notes.push(`${matched.field} ${matched.value} is also listed in zone ${hits.slice(1).map((h) => h.unit.zone).join(', ')} - used the first one.`);
-    res.needsReview = true;
+  const first = res.suggestions.find((s) => s.page);
+  if (first) {
+    const h = [...blocks].flatMap((b) => b.tokens.filter((t) => t.s === first.matchedText && t.page === first.page).map((token) => ({ unit: b, token })))[0];
+    if (h) res.evidence = evidenceFor(h.unit, h.token, null, section, `Suggestion only, not verified - ${first.matchedText}`, 'suggestion').slice(0, 1);
   }
-  if (matched.how === 'base') notes.push(`Matched "${token.s}" in the PDF by its base number.`);
-
-  res.matched = matched;
-  res.zone = block.zone;
-  res.page = token.page;
-  for (const [col, cell] of Object.entries(block.values)) res.values[CORP_COLUMN_LABELS[col]] = cell.v;
-
-  // Pick the rate column for the property type
-  const type = q.propertyType;
-  let col = CORP_COLUMN_FOR_TYPE[type];
-  if (type === 'industrial' && !block.values[6] && block.values[2]) {
-    col = 2;
-    notes.push('Open land industrial value is empty - used the open land residential value instead.');
-  }
-  if (!col) notes.push(`This table has no "${PROPERTY_TYPES[type] || type}" column - choose Shop, Office, Flat or Open land.`);
-  const cell = col ? block.values[col] : null;
-  if (cell) {
-    res.status = matched.how === 'neighbour' || col !== CORP_COLUMN_FOR_TYPE[type] ? 'fallback' : 'found';
-    res.rate = cell.v;
-    res.rateLabel = CORP_COLUMN_LABELS[col];
-    res.message = `Rs. ${cell.v} per sq. mt.`;
-  } else if (col) {
-    notes.push(`The "${CORP_COLUMN_LABELS[col]}" cell is empty for zone ${block.zone}.`);
-  }
-  res.evidence = evidenceFor(block, token, cell, section, `Zone ${block.zone} - ${block.label || res.section}`);
   return res;
 }
 
-async function lookupRuralNa(doc, file, q, pdfName, onProgress) {
-  const res = baseResult('B', q, pdfName);
-  const notes = res.notes;
-  const index = (await getIndex(doc, file, 'RURAL_NA', onProgress))
+async function lookupRural(doc, file, q, pdfName, onProgress) {
+  const table = RURAL_TABLES[q.pdfType];
+  const res = baseResult(table.flow, q, pdfName);
+  const index = (await getIndex(doc, file, q.pdfType, onProgress))
     .filter((e) => e.name)
     .map((e) => ({ ...e, village: e.name }));
 
-  let entries = matchVillage(index, q.village, notes);
-  const inTaluka = entries.filter((e) => nameKey(e.taluka) === nameKey(q.taluka));
-  if (inTaluka.length) entries = inTaluka;
-  else if (new Set(entries.map((e) => e.taluka)).size > 1) {
-    notes.push(`Village "${q.village}" exists in more than one taluka and taluka "${q.taluka || '-'}" did not match - used ${entries[0].taluka}.`);
-    entries = entries.filter((e) => e.taluka === entries[0].taluka);
-    res.needsReview = true;
-  }
+  let entries = index.filter((e) => nameKey(e.village) === nameKey(q.village));
   res.searches.push(String(q.village || '').toUpperCase());
   if (!entries.length) {
-    res.message = `${NO_DATA} - village "${q.village || '-'}" is not in ${pdfName}`;
+    fail(res, 'not_found', 'village_not_found', `${NOT_FOUND}: village "${q.village}" is not listed in ${pdfName}.`);
+    for (const n of similarNames(index.map((e) => e.village), q.village)) res.suggestions.push({ type: 'similar_village_name', requiresManualVerification: true, description: n });
     return res;
   }
+  entries = narrowByTaluka(res, entries, q);
+  if (!entries) return res;
+
 
   res.section = `${entries[0].village} (Taluka ${entries[0].taluka}, District ${entries[0].district})`;
   res.sectionPages = entries.map((e) => e.p);
-  const section = await parseNaSection(doc, res.sectionPages);
+  const section = await table.parse(doc, res.sectionPages);
   const { rows, header, pageWidth } = section;
-  const type = q.propertyType;
+  const suggest = (type, text, h) => suggestion(type, text, h, h.unit.values, table.columnsForType, table.columns, q.propertyType);
 
-  let hits = [];
-  let matched = null;
-  for (const [field, value] of [['RS No.', q.rsNo], ['BL No.', q.blNo]]) {
-    if (!value) continue;
-    res.searches.push(`${field} ${value}`);
-    hits = findNumber(rows, value);
-    if (hits.length) {
-      matched = { field, value, found: hits[0].token.s, how: hits[0].how };
-      break;
+  // the village table is a list of survey numbers, so only the survey number can verify a rate
+  if (q.rsNo) {
+    res.searches.push(`${FIELD_LABEL.rsNo} ${q.rsNo}`);
+    const hits = unitsListing(rows, q.rsNo, 'exact');
+    if (hits.length === 1) {
+      res.matched = { field: FIELD_LABEL.rsNo, value: q.rsNo, found: hits[0].token.s };
+      noteRelated(res, unitsListing(rows, q.rsNo, 'base'), hits[0], FIELD_LABEL.rsNo);
+      return settleRate(res, hits[0].unit, hits[0].token, q, table.columnsForType, table.columns, section, `${entries[0].village} - Survey No. ${hits[0].token.s}`);
     }
-    notes.push(`${field} ${value} is not listed for ${entries[0].village}.`);
-  }
-
-  if (!hits.length) {
-    // Last resort: the village baseline (Gamtal) rate printed at the top of the section
-    if (!header) return res;
-    const key = type === 'commercial' && header.gamtal.commercial ? 'commercial' : 'residential';
-    const cell = header.gamtal[key];
-    res.page = header.page;
-    for (const [k, c] of Object.entries(header.gamtal)) res.values[`Gamtal ${NA_COLUMN_LABELS[k]}`] = c.v;
-    res.matched = { field: 'Village baseline', value: entries[0].village, found: `Gamtal ${NA_COLUMN_LABELS[key]}`, how: 'gamtal' };
-    const rects = [rect('block', 18, pageWidth - 36, header.top + 16, header.bottom - 8)];
-    if (cell) rects.push(rect('value', cell.x - 3, cell.w + 6, cell.y + 10, cell.y - 3));
-    res.evidence = [{ page: header.page, rects, caption: `${entries[0].village} - Gamtal baseline rate` }];
-    if (['flat', 'shop', 'office'].includes(type)) {
-      res.status = 'insufficient';
-      res.message = INSUFFICIENT;
-    } else if (cell) {
-      res.status = 'fallback';
-      res.rate = cell.v;
-      res.rateLabel = `Gamtal ${NA_COLUMN_LABELS[key]} (village baseline)`;
-      res.message = `Rs. ${cell.v} per sq. mt.`;
-      notes.push('Neither RS No. nor BL No. matched - used the village baseline (Gamtal) rate.');
+    if (hits.length > 1) return settleAmbiguous(res, hits, 'rsNo', q.rsNo, q, table.columnsForType, table.columns, section);
+    fail(res, 'not_found', 'number_not_found', `${NOT_FOUND}: Survey No. ${q.rsNo} is not listed for village ${entries[0].village}.`);
+    for (const h of unitsListing(rows, q.rsNo, 'base').slice(0, 5)) {
+      res.suggestions.push(suggest('similar_number', `Survey No. ${h.token.s} is listed, not ${q.rsNo}.`, h));
     }
-    return res;
-  }
-
-  const { unit: row, token } = hits[0];
-  if (hits.length > 1) {
-    notes.push(`${matched.field} ${matched.value} appears in ${hits.length} rows - used the first one.`);
-    res.needsReview = true;
-  }
-  if (matched.how === 'base') notes.push(`Matched "${token.s}" in the PDF by its base number.`);
-  res.matched = matched;
-  res.page = token.page;
-  for (const [k, c] of Object.entries(row.values)) res.values[NA_COLUMN_LABELS[k]] = c.v;
-
-  let cell = null;
-  if (['flat', 'shop', 'office'].includes(type)) {
-    res.status = 'insufficient';
-    res.message = INSUFFICIENT;
-    notes.push(`The Rural NA table only has Residential / Commercial / Industrial columns - no rate for ${PROPERTY_TYPES[type]}.`);
   } else {
-    cell = row.values[type] || null;
-    if (cell) {
-      res.status = 'found';
-      res.rate = cell.v;
-      res.rateLabel = NA_COLUMN_LABELS[type];
-      res.message = `Rs. ${cell.v} per sq. mt.`;
-    } else {
-      notes.push(`The "${NA_COLUMN_LABELS[type] || type}" cell is empty for this row.`);
+    fail(res, 'not_found', 'survey_number_required', `${NOT_FOUND}: the village table lists survey numbers. Give the Survey (RS) No. to verify a rate.`);
+  }
+
+  if (q.blNo) {
+    res.searches.push(`${FIELD_LABEL.blNo} ${q.blNo}`);
+    for (const h of unitsListing(rows, q.blNo, 'exact').slice(0, 3)) {
+      res.suggestions.push(suggest('other_identifier', `The number ${h.token.s} (your Block No.) appears in the survey number list. It may be a different property.`, h));
     }
   }
-  res.evidence = evidenceFor(row, token, cell, section, `${entries[0].village} - ${matched.field} ${token.s}`);
+  if (header) {
+    const key = q.propertyType === 'commercial' ? 'commercial' : 'residential';
+    const cell = header.gamtal[key];
+    if (cell) {
+      res.suggestions.push({
+        type: 'village_baseline', requiresManualVerification: true,
+        description: `Village baseline (Gamtal ${RURAL_COLUMNS[key]}) rate is ${cell.v}. It is a village-level figure, not this property's rate.`,
+        matchedText: null, zone: null, page: header.page, rate: cell.v, rateCategory: `Gamtal ${RURAL_COLUMNS[key]}`,
+      });
+    }
+  }
+  const first = res.suggestions.find((s) => s.matchedText && s.page);
+  if (first) {
+    const h = rows.flatMap((r) => r.tokens.filter((t) => t.s === first.matchedText && t.page === first.page).map((token) => ({ unit: r, token })))[0];
+    if (h) res.evidence = evidenceFor(h.unit, h.token, null, section, `Suggestion only, not verified - ${first.matchedText}`, 'suggestion').slice(0, 1);
+  } else if (header && res.suggestions.some((s) => s.type === 'village_baseline')) {
+    res.evidence = [{ page: header.page, role: 'suggestion', expect: null, caption: `Suggestion only, not verified - ${entries[0].village} village baseline`,
+      rects: [rect('block', 18, pageWidth - 36, header.top + 16, header.bottom - 8)] }];
+  }
   return res;
 }
 
 async function lookup(doc, file, q, pdfName, onProgress) {
   // Corporation and Nagarpalika PDFs use the same table, so both go through Flow A
-  if (q.pdfType === 'RURAL_NA') return lookupRuralNa(doc, file, q, pdfName, onProgress);
-  return lookupCorporation(doc, file, q, pdfName, onProgress);
+  if (RURAL_TABLES[q.pdfType]) return lookupRural(doc, file, q, pdfName, onProgress);
+  return lookupUrban(doc, file, q, pdfName, onProgress);
 }
 
-module.exports = { lookup, PROPERTY_TYPES, nameKey };
+module.exports = { lookup, baseResult, similarNames, PROPERTY_TYPES, RATE_UNIT, NOT_FOUND, nameKey };

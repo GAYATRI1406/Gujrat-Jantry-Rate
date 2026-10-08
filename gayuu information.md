@@ -30,7 +30,8 @@ Pick from lists, top to bottom. Each box unlocks after the one before it.
 5. TPS No. (only shown when that village has TPS schemes)
 6. Type the number: **FP No.** if you chose a TPS, otherwise the **Survey / RS No.**
 7. Property type
-8. Press **Search Jantri rate**
+8. Property area and unit (optional, for the government value)
+9. Press **Search Jantri rate**
 
 ### 2. Chat
 The bot asks one question at a time. Click one of the answers shown under the question, or type your answer in the box and press Enter. It starts the search by itself when it has everything.
@@ -46,13 +47,17 @@ The bot shows what it read from the address. Correct anything that is wrong, the
 
 ## Read the result
 
+A rate is shown only when the property's number is matched exactly. In every other case no rate is given, and you must check by hand.
+
 | Result | Meaning |
 |---|---|
-| **Rate found** | The number was found and the rate is shown. |
-| **Fallback value used** | The exact number or cell was missing, so a fallback rule was used. The notes say which one. |
-| **No data found** | The number is not listed, or the rate cell is empty in the PDF. |
-| **Insufficient data found** | Flat, Shop or Office was asked for in a village PDF, which has no such columns. |
-| **Needs a manual check** | The number is listed more than once, or two fallbacks disagree. Check the screenshot. |
+| **Verified rate** | The number is listed exactly once and the rate is shown, with the screenshot of that entry. |
+| **Exact Match Not Found** | The district, village or number is not listed. Suggestions may be shown below, but they are not the property's rate. |
+| **Ambiguous** | The number is listed more than once, or the property type is too general (for example "Commercial" in a city, which can be Office or Shop). |
+| **Rate not available** | The entry was found, but its rate cell is blank in the PDF. |
+| **Not supported** | The website has no PDF for that area, or the table has no rate for that property type. |
+
+If you enter the property area, a verified result also shows the **government value**: area in sq. mt. multiplied by the rate, with the calculation written out. No other charges are added.
 
 Click the screenshot to enlarge it. **Full page** shows the whole PDF page. **History** (top right) lists earlier searches.
 
@@ -66,21 +71,22 @@ Click the screenshot to enlarge it. **Full page** shows the whole PDF page. **Hi
 1. The bot opens the blog page that lists the Jantri PDFs and clicks the link for your district.
 2. It downloads that PDF once and keeps it for next time.
 3. It reads the PDF's text and finds your village (and TPS section, if any).
-4. It looks for your number in that section:
-   - **City / town PDFs:** FP No. inside the TPS section, or Survey No. when there is no TPS. If the FP No. is missing, it tries the FP number just before and just after.
-   - **Village PDFs:** RS No. first, then BL No., then the village baseline (Gamtal) rate.
-5. It picks the rate column for your property type, highlights the row and takes the screenshot.
+4. It looks for your number in that section, and it must match exactly:
+   - **City / town PDFs:** FP No. inside the TPS section, or Survey No. when there is no TPS.
+   - **Village PDFs:** the Survey (RS) No.
+   - Near misses, such as the neighbouring FP number or the village baseline rate, are listed only as suggestions.
+5. It picks the rate column for your property type, highlights the entry, takes the screenshot, and checks that the highlighted number is the rate it returns.
 
 The bot decides which PDF to use from what is printed inside each PDF, not from the file name on the website, because several files there are mislabelled.
 
 ## Limits to know
 
-- **Ahmedabad city (AMC) does not work.** That PDF's text cannot be read by a program. Ahmedabad's towns and villages do work.
-- **Banaskantha has no village (Rural NA) PDF** on the website.
-- **Rural Agri PDFs are never used.**
-- In towns the same survey number can appear in more than one ward. The bot takes the first one and marks it for a manual check.
+- **Ahmedabad city (AMC)** works, but its sections have long names such as `NAVA VADAJ- FINAL T.P.S NO - 28`. Use **Select details** or **Chat** to pick the name from the list.
+- **Banaskantha has no village (Rural NA) PDF** on the website, so only agricultural land works for its villages.
+- **Agricultural land in a village:** choose Rural NA (village), then Agricultural - irrigated or non irrigated. The bot reads the Rural Agri PDF for those.
+- In towns the same survey number can appear in more than one ward. The bot then returns no rate and lists every place it found.
 - Search history is saved to a file on this PC unless MongoDB is installed.
 
 ## If the website changes
 
-Run `npm run sync` to re-read every PDF (about 25 minutes), then `npm run selftest` to check the lookups.
+Run `npm run sync` to re-read every PDF (about 50 minutes), then `npm run selftest` to check the lookups.

@@ -7,8 +7,9 @@ const path = require('path');
 const config = require('../src/config');
 const { getBrowser } = require('../src/bot');
 const { readBlogLinks, saveLinks, loadLinks, downloadPdf, fileNameOf } = require('../src/pdfSource');
-const { openPdf, detectKind, getIndex, parseCorpSection, parseNaSection } = require('../src/pdfIndex');
+const { openPdf, detectKind, getIndex, parseCorpSection, parseNaSection, parseAgriSection } = require('../src/pdfIndex');
 const { CATALOG_FILE } = require('../src/catalog');
+const { makeTextTwin } = require('../src/textTwin');
 
 const REPORT_FILE = path.join(config.DATA_DIR, 'check-report.json');
 // one result file per PDF, so an interrupted run continues where it stopped (--force starts over)
@@ -63,7 +64,9 @@ async function checkPdf(doc, kind, index) {
     if (!sec.name) continue;
     stats.sections++;
     let units;
-    if (kind === 'RURAL_NA') {
+    if (kind === 'RURAL_AGRI') {
+      units = (await parseAgriSection(doc, sec.pages)).rows;
+    } else if (kind === 'RURAL_NA') {
       const parsed = await parseNaSection(doc, sec.pages);
       units = parsed.rows;
       if (!parsed.header) stats.noGamtal = (stats.noGamtal || 0) + 1;
@@ -87,7 +90,7 @@ async function checkPdf(doc, kind, index) {
 
 (async () => {
   const seen = new Set();
-  const links = (await blogLinks()).filter((l) => !/agri/i.test(fileNameOf(l.href)) && !seen.has(l.href) && seen.add(l.href));
+  const links = (await blogLinks()).filter((l) => !seen.has(l.href) && seen.add(l.href));
   console.log(`${links.length} PDFs to check`);
   const files = [];
   const report = [];
@@ -104,9 +107,16 @@ async function checkPdf(doc, kind, index) {
     const entry = { file: name, href: link.href, row: link.row || '', kind: null, district: '', talukas: [], pages: 0, names: [] };
     try {
       const pdf = await downloadPdf(link.href);
-      const doc = await openPdf(pdf.file);
+      let doc = await openPdf(pdf.file);
       entry.pages = doc.numPages;
       entry.kind = await detectKind(doc);
+      if (!entry.kind) {
+        // unreadable text: repair the font names in a copy and read from that (see src/textTwin.js)
+        await doc.destroy();
+        entry.textRepaired = await makeTextTwin(pdf.file);
+        doc = await openPdf(pdf.file);
+        entry.kind = await detectKind(doc);
+      }
       if (entry.kind) {
         const index = await getIndex(doc, pdf.file, entry.kind);
         entry.district = mostCommon(index.map((e) => e.district))[0] || '';

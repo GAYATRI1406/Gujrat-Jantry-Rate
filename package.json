@@ -12,6 +12,7 @@
     "build": "npm run build -w client",
     "sync": "npm run sync -w server",
     "selftest": "npm run selftest -w server",
+    "report": "npm run report -w server",
     "start": "npm run build -w client && npm run start -w server"
   },
   "devDependencies": {

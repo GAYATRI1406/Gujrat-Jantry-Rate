@@ -1,15 +1,15 @@
 // Question-and-answer flow for the "Chat" option. The bot asks one thing at a time and searches when
 // it has everything. Pure functions: state in, state out.
 //   state = { step, f (the fields collected so far), districts, kinds (from /api/places), choices, note }
-import { PROPERTY_TYPES } from './constants.js';
+import { PROPERTY_TYPES, TYPES_BY_AREA } from './constants.js';
 
 const AREA = {
   CORPORATION: 'City (Corporation)',
   NAGARPALIKA: 'Town (Nagarpalika)',
   RURAL_NA: 'Village (Rural NA)',
 };
-const RURAL_TYPES = { residential: 'Residential', commercial: 'Commercial', industrial: 'Industrial' };
-const URBAN_TYPES = ['flat', 'shop', 'office', 'residential', 'industrial'];
+// words people use for an area unit -> the unit the server understands (plain number = sq. mt.)
+const UNIT_WORDS = [[/ft|feet|foot/, 'sqft'], [/yd|yard|var|gaj/, 'sqyd'], [/gunt/, 'guntha'], [/acre/, 'acre'], [/hect|\bha\b/, 'hectare']];
 const SKIP = /^(skip|no|none|nil|na|n\/a|-)$/i;
 
 const key = (s) => String(s).toUpperCase().replace(/[^A-Z0-9]/g, '');
@@ -31,9 +31,8 @@ function optionsFor(s) {
       return [...v.tps.map((t) => opt(`TPS-${t}`, t)), ...(v.plain ? [opt('No TPS', '')] : [])];
     }
     case 'bl': return [opt('Skip', '')];
-    case 'type': return rural(s)
-      ? Object.entries(RURAL_TYPES).map(([value, label]) => opt(label, value))
-      : URBAN_TYPES.map((value) => opt(PROPERTY_TYPES[value], value));
+    case 'type': return TYPES_BY_AREA[s.f.pdfType].map((value) => opt(PROPERTY_TYPES[value], value));
+    case 'area': return [opt('Skip', '')];
     default: return [];
   }
 }
@@ -46,8 +45,9 @@ const QUESTIONS = {
   tps: () => 'Which TPS number?',
   fp: () => 'What is the FP No. (Final Plot number)?',
   rs: (s) => (rural(s) ? 'What is the RS No. (survey number)?' : 'What is the Survey / City Survey No.?'),
-  bl: () => 'What is the BL No.? Type "skip" if you do not have one.',
+  bl: () => 'What is the Block No.? Type "skip" if you do not have one.',
   type: () => 'What type of property is it?',
+  area: () => 'What is the property area? Type a number for sq. mt., or add the unit, for example "1200 sqft". Type "skip" for the rate only.',
 };
 
 // The question to show for the current step, with the answers the user can pick from.
@@ -75,11 +75,12 @@ function advance(s) {
     else if (step === 'loaded') next = 'kind';
     else if (step === 'kind') next = 'taluka';
     else if (step === 'taluka') next = 'village';
-    else if (step === 'village') next = !rural(state) && villageOf(state).tps.length ? 'tps' : 'rs';
+    else if (step === 'village') next = rural(state) ? 'rs' : villageOf(state).tps.length ? 'tps' : villageOf(state).fpList ? 'fp' : 'rs';
     else if (step === 'tps') next = f.tps ? 'fp' : 'rs';
     else if (step === 'fp') next = 'type';
     else if (step === 'rs') next = rural(state) ? 'bl' : 'type';
     else if (step === 'bl') next = 'type';
+    else if (step === 'type') next = 'area';
     else next = 'done';
 
     state = { ...state, step: next };
@@ -119,6 +120,16 @@ export function answer(s, text, picked) {
     // nothing matched: offer names that start with the same letter
     const near = options.filter((o) => key(o.label)[0] === key(value)[0]).slice(0, 14);
     return { state: { ...s, choices: near.length ? near : null }, error: `I could not find "${value}" in the list. Please check the spelling${near.length ? ' or pick one below' : ''}.` };
+  }
+
+  if (s.step === 'area') {
+    if (picked || SKIP.test(value)) return { state: advance({ ...s, f: { ...s.f, area: '', areaUnit: 'sqmt' } }) };
+    const m = value.replace(/,/g, '').match(/^(\d+(?:\.\d+)?)\s*(.*)$/);
+    if (!m || !(Number(m[1]) > 0)) return { state: s, error: 'Please type the area as a number, for example 100 or 1200 sqft, or type skip.' };
+    const words = m[2].toLowerCase();
+    if (/bigha|vigha/.test(words)) return { state: s, error: 'Bigha / vigha has no single fixed size. Please give the area in sq. mt., sq. ft., sq. yd., guntha, acre or hectare.' };
+    const unit = (UNIT_WORDS.find(([re]) => re.test(words)) || [null, 'sqmt'])[1];
+    return { state: advance({ ...s, f: { ...s.f, area: m[1], areaUnit: unit } }) };
   }
 
   if (s.step === 'bl') return { state: advance({ ...s, f: { ...s.f, blNo: SKIP.test(value) ? '' : value } }) };

@@ -22,10 +22,11 @@ function detectPropertyType(s) {
   return null;
 }
 
-function detectPdfType({ tps, taluka }, s) {
+// Only when the address says so. Otherwise it is left empty and the PDF that lists the village is used.
+function detectPdfType(s) {
   if (/nagar\s*palika|municipality/i.test(s)) return 'NAGARPALIKA';
-  if (tps || /\bcity\b/i.test(taluka || '') || /corporation|mahanagar/i.test(s)) return 'CORPORATION';
-  return 'RURAL_NA';
+  if (/corporation|mahanagar/i.test(s)) return 'CORPORATION';
+  return '';
 }
 
 function parseAddress(raw) {
@@ -41,7 +42,7 @@ function parseAddress(raw) {
     blNo: grab(new RegExp(`\\b(?:B\\.?\\s*L\\.?|Block)${SEP}${NUM}`, 'i'), s),
   };
   fields.propertyType = detectPropertyType(s);
-  fields.pdfType = detectPdfType(fields, s);
+  fields.pdfType = detectPdfType(s);
   return fields;
 }
 

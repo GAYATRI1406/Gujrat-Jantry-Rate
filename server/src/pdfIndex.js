@@ -8,6 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const pdfjs = require('pdfjs-dist/legacy/build/pdf.js');
 const { INDEX_DIR } = require('./config');
+const { textFile } = require('./textTwin');
 
 const DIGITS = /^\d+$/;
 const LINE_TOLERANCE = 4;
@@ -21,7 +22,8 @@ const LIST_LABEL = /^(FP|F\.P|Survey|Block|TPS|T\.P|City|C\.?S|R\.?S|Ward|Tika|S
 const LIST_FILLER = /plots|boundary|zone|included|^and\b|^all\b|^other\b|^in\b|^the\b/i;
 
 async function openPdf(file) {
-  const data = new Uint8Array(await fs.promises.readFile(file));
+  // a PDF whose fonts lost their character names is read from its corrected copy (see textTwin.js)
+  const data = new Uint8Array(await fs.promises.readFile(textFile(file)));
   return pdfjs.getDocument({ data, verbosity: 0, disableFontFace: true }).promise;
 }
 
@@ -131,6 +133,7 @@ function naHeader(lines) {
 async function detectKind(doc) {
   const { lines } = await pageLines(doc, 1);
   const text = lines.slice(0, 12).flatMap((l) => l.items.map((t) => t.s));
+  if (text.some((s) => /Rs\.?\s*per\s*acre/i.test(s))) return 'RURAL_AGRI'; // also prints "per Sq.Mts", so check it first
   if (text.some((s) => /Rs\.?\s*per\s*Sq/i.test(s))) return 'RURAL_NA';
   if (text.some((s) => /CORPORATION/.test(s))) return 'CORPORATION';
   if (text.some((s) => /NAGARPALIKA/.test(s))) return 'NAGARPALIKA';
@@ -144,7 +147,7 @@ async function getIndex(doc, file, kind, onProgress) {
   const pages = [];
   for (let p = 1; p <= doc.numPages; p++) {
     const { lines } = await pageLines(doc, p);
-    const h = kind === 'RURAL_NA' ? naHeader(lines) : corpHeader(lines);
+    const h = kind === 'RURAL_NA' ? naHeader(lines) : kind === 'RURAL_AGRI' ? agriHeader(lines) : corpHeader(lines);
     pages.push({ p, district: h.district, taluka: h.taluka, name: h.name });
     if (onProgress && (p % 40 === 0 || p === doc.numPages)) onProgress(p, doc.numPages);
   }
@@ -172,8 +175,11 @@ function addTokens(unit, items, page) {
       if (!text || LIST_FILLER.test(text)) continue;
       const start = m.index + m[0].indexOf(m[0].trim());
       const scale = it.w / glyphWidth(it.raw);
+      // "356TO365" is a run of numbers; kept as printed, with its two ends so a number inside it can be matched
+      const run = /^(?:-\/)?(\d+)\s*TO\s*(\d+)$/i.exec(text);
       unit.tokens.push({
         s: text, page, y: it.y,
+        range: run && Number(run[2]) > Number(run[1]) && Number(run[2]) - Number(run[1]) <= 500 ? [Number(run[1]), Number(run[2])] : null,
         x: it.x + glyphWidth(it.raw.slice(0, start)) * scale,
         w: Math.max(glyphWidth(text) * scale, 6),
       });
@@ -190,6 +196,7 @@ async function parseCorpSection(doc, pageNos) {
     const { lines, width } = await pageLines(doc, p);
     pageWidth = width;
     const { bodyStart, head } = corpHeader(lines);
+    const scale = 612 / width; // column positions are for a 612pt wide page; some PDFs are A4 (595pt)
     heads[p] = head;
     for (const line of lines.slice(bodyStart)) {
       const [first, ...rest] = line.items;
@@ -200,7 +207,7 @@ async function parseCorpSection(doc, pageNos) {
         cur = { zone: zoneLine ? first.s : '', label: '', values: {}, tokens: [], parts: [] };
         blocks.push(cur);
         for (const t of (zoneLine ? rest : line.items).filter((v) => Number(v.s) > 0)) {
-          const column = CORP_COLUMNS.reduce((a, b) => (Math.abs(b.x - t.x) < Math.abs(a.x - t.x) ? b : a));
+          const column = CORP_COLUMNS.reduce((a, b) => (Math.abs(b.x - t.x * scale) < Math.abs(a.x - t.x * scale) ? b : a));
           cur.values[column.col] = { v: Number(t.s), page: p, x: t.x, y: t.y, w: t.w };
         }
       } else {
@@ -250,4 +257,74 @@ async function parseNaSection(doc, pageNos) {
   return { rows, heads, header, pageWidth };
 }
 
-module.exports = { openPdf, detectKind, getIndex, parseCorpSection, parseNaSection };
+// ---------- Rural Agri PDF ----------
+// Header: district / taluka / village, with "Rs.per acre" and "(Rs. per Sq.Mts)".
+// Rows:   [survey number list ending in "."] then one rate per column, printed as "457300/-" (per acre)
+//         with "(113/-)" (per sq. mt.) on the line below.
+const AGRI_COLUMNS = [[275, 'non_irrigated'], [350, 'irrigated'], [430, 'kharaba'], [Infinity, 'mineral']];
+const agriColumn = (x) => AGRI_COLUMNS.find(([limit]) => x < limit)[1];
+const isRateUnit = (t) => /Rs\.?\s*per/i.test(t.s);
+
+function agriHeader(lines) {
+  const h = { district: '', taluka: '', name: '', bodyStart: 0, head: null };
+  const li = lines.findIndex((l) => l.items.some((t) => /per\s*acre/i.test(t.s)));
+  if (li < 0) return h;
+  // the three names are the plain (not bold) words printed below the "per acre" line
+  const names = [];
+  let nameLine = li;
+  for (let i = li; i < Math.min(lines.length, li + 6); i++) {
+    for (const t of values(lines[i])) {
+      if (isRateUnit(t) || t.x >= 480) continue;
+      names.push(t);
+      nameLine = i;
+    }
+    if (names.filter((t) => t.x < 200).length >= 2) break;
+  }
+  const left = names.filter((t) => t.x < 200).sort((a, b) => b.y - a.y);
+  h.district = left[0] ? left[0].s : '';
+  h.name = left.slice(1).map((t) => t.s).join(' ');
+  h.taluka = joined(names.filter((t) => t.x >= 200));
+  // rows start at the left margin; everything between the names and the first row is the column titles
+  let i = nameLine + 1;
+  while (i < lines.length && lines[i].items[0].x >= 60) i++;
+  h.bodyStart = i;
+  if (i > nameLine + 1) h.head = { top: lines[nameLine + 1].top + 14, bottom: lines[i - 1].bottom - 8 };
+  return h;
+}
+
+async function parseAgriSection(doc, pageNos) {
+  const rows = [];
+  const heads = {};
+  let cur = null;
+  let pageWidth = 595;
+  for (const p of pageNos) {
+    const { lines, width } = await pageLines(doc, p);
+    pageWidth = width;
+    const h = agriHeader(lines);
+    heads[p] = h.head;
+    let last = cur;
+    for (const line of lines.slice(h.bodyStart)) {
+      if (line.items[0].s.startsWith('*')) break; // footnotes
+      const left = line.items.filter((t) => t.x < 225);
+      if (left.length) {
+        if (!cur) rows.push((cur = { values: {}, acre: {}, tokens: [], parts: [] }));
+        addTokens(cur, left, p);
+        last = cur;
+      }
+      if (!last) continue;
+      for (const t of line.items.filter((v) => v.x >= 225 && v.x < 500)) {
+        const perAcre = /^(\d+)\/-$/.exec(t.s);
+        const perSqmt = /^\((\d+)\/-\)$/.exec(t.s);
+        const col = agriColumn(t.x);
+        if (perAcre && Number(perAcre[1]) > 0) last.acre[col] = Number(perAcre[1]);
+        if (perSqmt && Number(perSqmt[1]) > 0) last.values[col] = { v: Number(perSqmt[1]), page: p, x: t.x, y: t.y, w: t.w };
+      }
+      extend(last, p, line);
+      if (left.length && /\.\s*$/.test(left[left.length - 1].s)) cur = null; // a list ends with "."
+    }
+  }
+  for (const row of rows) for (const [col, cell] of Object.entries(row.values)) cell.acre = row.acre[col] || null;
+  return { rows, heads, header: null, pageWidth };
+}
+
+module.exports = { openPdf, detectKind, getIndex, parseCorpSection, parseNaSection, parseAgriSection };

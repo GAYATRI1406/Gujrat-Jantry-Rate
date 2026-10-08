@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useBot } from './useBot.js';
 import { DetailsCard, ProgressCard, ResultCard, SelectCard } from './Cards.jsx';
-import { PDF_TYPES, PROPERTY_TYPES } from './constants.js';
+import { AREA_UNITS, PDF_TYPES, PROPERTY_TYPES } from './constants.js';
 import { answer, question, startState, withPlaces } from './chatFlow.js';
 
 let nextId = 1;
@@ -35,11 +35,12 @@ function describe(f) {
     f.tps && `TPS No. ${f.tps}`,
     f.fp && `FP No. ${f.fp}`,
     f.rsNo && `Survey No. ${f.rsNo}`,
-    f.blNo && `BL No. ${f.blNo}`,
+    f.blNo && `Block No. ${f.blNo}`,
     PROPERTY_TYPES[f.propertyType],
     f.taluka && `Taluka ${f.taluka}`,
     f.district && `District ${f.district}`,
     PDF_TYPES[f.pdfType],
+    f.area && `Area ${f.area} ${AREA_UNITS[f.areaUnit || 'sqmt']}`,
   ].filter(Boolean).join(', ');
 }
 

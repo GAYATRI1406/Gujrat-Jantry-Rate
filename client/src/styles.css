@@ -127,6 +127,16 @@ button:disabled { cursor: not-allowed; opacity: .65; }
 .result summary { cursor: pointer; color: var(--link); }
 .result details dl { margin-top: 6px; }
 .notes { margin: 10px 0 0; padding-left: 18px; font-size: 13px; }
+.result h4 { margin: 0 0 6px; font-size: 13px; color: var(--header); }
+.valuation { margin-top: 12px; padding: 10px; border: 1px solid #b2dba1; border-radius: 4px; background: #f3faef; }
+.valuation dl { margin-top: 0; background: #fff; }
+.fineprint { margin: 6px 0 0; font-size: 12px; color: var(--muted); }
+.alternatives { margin-top: 12px; padding: 10px; border: 1px solid #f0d9a8; border-radius: 4px; background: #fffaf0; }
+.alternatives .warning { margin: 0 0 6px; font-size: 12px; font-weight: bold; color: #8a6d3b; }
+.alternatives ul { margin: 0; padding-left: 18px; font-size: 13px; }
+.alternatives li + li { margin-top: 4px; }
+.alternatives em { display: block; font-style: normal; color: var(--muted); }
+.result a { color: var(--link); overflow-wrap: anywhere; }
 .result figure { margin: 12px 0 0; }
 .result figure img { display: block; width: 100%; border: 1px solid var(--line); cursor: zoom-in; }
 .result figcaption { display: flex; justify-content: space-between; gap: 10px; margin-top: 4px; font-size: 12px; color: var(--muted); }
